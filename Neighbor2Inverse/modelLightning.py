@@ -10,6 +10,7 @@ from torchvision.utils import save_image
 from torch_radon import Radon, RadonFanbeam
 import pandas as pd
 from utilForwardProp import propTIE_torch
+from astra_cone_array import astra_cone_from_array # our cone beam reconstructor
 
 torch.autograd.set_detect_anomaly(True)
 operation_seed_counter = 0
@@ -260,8 +261,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 PR_params = None,
                 n_slices = 1,
                 n_slicesPR = None,
+                #sparseSampling = 1,
+                #dataFidelity = False,
                 sparseSampling = 1,
-                dataFidelity = False
+                dataFidelity = False,
+                coneBeam = False,
+                coneBeam_params = None
 
                 ):
         
@@ -299,6 +304,9 @@ class Neighbor2InverseSlice(pl.LightningModule):
             self.sigma = PR_params['delta'] / self.mu * PR_params['z']
 
         self.sparseSampling = sparseSampling
+
+        self.coneBeam = coneBeam
+        self.coneBeam_params = coneBeam_params
 
     def forward(self, x):
         return self.network(x)
