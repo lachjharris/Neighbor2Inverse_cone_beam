@@ -7,7 +7,7 @@ import lightning as pl
 import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
-from dataset import ProjDatasetSlice, ProjDataset
+from dataset import ProjDatasetSlice, ProjDataset, ConeBeamProjDataset
 from modelLightning import *
 import yaml
 import sys
@@ -26,14 +26,39 @@ def main(trainparams):
     print(trainparams)
     
     # ----- initialize dataset -----
-    if trainparams['dataset']['path_reco']:
-        #load projections and precomputed reconstructions
-        dataset_train = ProjDatasetSlice(**trainparams['dataset'], **trainparams['dataset_train'])
-        dataset_val = ProjDatasetSlice(**trainparams['dataset'], **trainparams['dataset_val'])
+    if trainparams['lightning_params'].get('coneBeam', False):
+
+        dataset_train = ConeBeamProjDataset(
+            **trainparams['dataset_train']
+        )
+
+        dataset_val = ConeBeamProjDataset(
+            **trainparams['dataset_val']
+        )
+
+    elif trainparams['dataset']['path_reco']:
+
+        dataset_train = ProjDatasetSlice(
+            **trainparams['dataset'],
+            **trainparams['dataset_train']
+        )
+
+        dataset_val = ProjDatasetSlice(
+            **trainparams['dataset'],
+            **trainparams['dataset_val']
+        )
+
     else:
-        #load only projections
-        dataset_train = ProjDataset(**trainparams['dataset'], **trainparams['dataset_train'])
-        dataset_val = ProjDataset(**trainparams['dataset'], **trainparams['dataset_val'])
+
+        dataset_train = ProjDataset(
+            **trainparams['dataset'],
+            **trainparams['dataset_train']
+        )
+
+        dataset_val = ProjDataset(
+            **trainparams['dataset'],
+            **trainparams['dataset_val']
+        )
 
     # initialize the dataloaders
     dataloader_train = DataLoader(dataset_train, **trainparams['train_loader'])
