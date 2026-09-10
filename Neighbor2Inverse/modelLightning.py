@@ -310,6 +310,59 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
     def forward(self, x):
         return self.network(x)
+
+    def reconstruct_cone(self, projections):
+    """
+    Cone-beam FDK reconstruction using ASTRA.
+
+    Args:
+        projections:
+            Phase-retrieved projections with shape
+            [angles, rows, cols] or [angles, 1, rows, cols].
+
+    Returns:
+        torch.Tensor:
+            Reconstructed volume [z, y, x].
+    """
+
+    if projections.ndim == 4:
+        if projections.shape[1] != 1:
+            raise ValueError(
+                f"Expected singleton channel dimension, "
+                f"got shape {tuple(projections.shape)}"
+            )
+
+        projections = projections[:, 0]
+
+    if projections.ndim != 3:
+        raise ValueError(
+            f"Expected [angles, rows, cols], "
+            f"got shape {tuple(projections.shape)}"
+        )
+
+    device = projections.device
+
+    projections_np = (
+        projections
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+    )
+
+    reconstruction_np = astra_cone_from_array(
+        projections_np,
+        **self.coneBeam_params,
+    )
+
+    reconstruction = torch.from_numpy(
+        reconstruction_np
+    ).to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    return reconstruction
         
     def training_step(self, batch, batch_idx):
 
