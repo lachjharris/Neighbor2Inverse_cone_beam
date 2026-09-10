@@ -202,7 +202,41 @@ class ProjDataset(torch.utils.data.Dataset):
             proj_stack = proj_stack[::self.sparseSampling]
 
         return proj_stack[:, 0]
-        
+
+
+class ConeBeamProjDataset(torch.utils.data.Dataset):
+    """
+    Dataset for cone-beam N2I scans.
+
+    Returns the HDF5 path and scan identifier only.
+    Projection data are streamed from HDF5 inside the cone-beam
+    reconstruction path rather than loaded into RAM by the DataLoader.
+    """
+
+    def __init__(self, df_path):
+        self.df = pd.read_csv(df_path)
+
+        if "path_proj" not in self.df.columns:
+            raise ValueError(
+                "ConeBeamProjDataset CSV must contain a 'path_proj' column"
+            )
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+
+        row = self.df.iloc[idx]
+
+        path_proj = str(row["path_proj"])
+
+        if "scan_id" in self.df.columns:
+            scan_id = str(row["scan_id"])
+        else:
+            scan_id = str(idx)
+
+        return path_proj, scan_id
+
 class ClinicalDataset(torch.utils.data.Dataset):
     """
     torch dataset for clinical PE data
