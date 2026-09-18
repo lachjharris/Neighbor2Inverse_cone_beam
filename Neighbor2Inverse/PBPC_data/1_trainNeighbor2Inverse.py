@@ -88,7 +88,7 @@ def main(trainparams):
                         )
     
     # -----  define callbacks/loggers -----
-    save_path = os.path.abspath(trainparams['save_path'] + f"/{trainparams['dataset']['exptime']}Sparse{int(trainparams["dataset"]['sparseSampling'])}/{trainparams['name']}/")
+    save_path = os.path.abspath(trainparams['save_path'] + f"/{trainparams['dataset']['exptime']}Sparse{int(trainparams['dataset']['sparseSampling'])}/{trainparams['name']}/")
 
     lr_monitor = pl.pytorch.callbacks.LearningRateMonitor(logging_interval='epoch') 
     tblogger = pl.pytorch.loggers.TensorBoardLogger(save_path) 
