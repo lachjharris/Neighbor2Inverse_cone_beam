@@ -208,7 +208,7 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
     """
     Dataset for cone-beam N2I scans.
 
-    Returns the HDF5 path and scan identifier only.
+    Returns the HDF5 path, scan identifier, and scan-specific cone-beam offsets.
     Projection data are streamed from HDF5 inside the cone-beam
     reconstruction path rather than loaded into RAM by the DataLoader.
     """
@@ -220,6 +220,15 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
             raise ValueError(
                 "ConeBeamProjDataset CSV must contain a 'path_proj' column"
             )
+
+        for column in [
+            "detector_offset_m",
+            "source_offset_m",
+        ]:
+            if column not in self.df.columns:
+                raise ValueError(
+                    f"ConeBeamProjDataset CSV must contain a '{column}' column"
+                )
 
     def __len__(self):
         return len(self.df)
@@ -235,7 +244,20 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
         else:
             scan_id = str(idx)
 
-        return path_proj, scan_id
+        detector_offset_m = float(
+            row["detector_offset_m"]
+        )
+
+        source_offset_m = float(
+            row["source_offset_m"]
+        )
+
+        return (
+            path_proj,
+            scan_id,
+            detector_offset_m,
+            source_offset_m,
+        )
 
 class ClinicalDataset(torch.utils.data.Dataset):
     """

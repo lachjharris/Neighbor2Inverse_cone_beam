@@ -312,7 +312,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
     def forward(self, x):
         return self.network(x)
 
-    def reconstruct_cone(self, projections):
+    def reconstruct_cone(
+        self,
+        projections,
+        detector_offset_m=None,
+        source_offset_m=None,
+    ):
         """
         Cone-beam FDK reconstruction using ASTRA.
 
@@ -351,9 +356,21 @@ class Neighbor2InverseSlice(pl.LightningModule):
             .numpy()
         )
 
+        cone_params = self.coneBeam_params.copy()
+
+        if detector_offset_m is not None:
+            cone_params["horizontal_detector_offset_m"] = float(
+                detector_offset_m
+            )
+
+        if source_offset_m is not None:
+            cone_params["horizontal_source_offset_m"] = float(
+                source_offset_m
+            )
+
         reconstruction_np = astra_cone_from_array(
             projections_np,
-            **self.coneBeam_params,
+            **cone_params,
         )
 
         reconstruction = torch.from_numpy(
@@ -366,11 +383,19 @@ class Neighbor2InverseSlice(pl.LightningModule):
         return reconstruction
 
     def training_step_cone(self, batch, batch_idx):
-        path_proj, scan_id = batch
+        path_proj, scan_id, detector_offset_m, source_offset_m = batch
 
-        # DataLoader batch size is 1, so unwrap the strings.
+        # DataLoader batch size is 1, so unwrap the values.
         path_proj = path_proj[0]
         scan_id = scan_id[0]
+        detector_offset_m = detector_offset_m[0].item()
+        source_offset_m = source_offset_m[0].item()
+
+        print(
+            f"Cone geometry for {scan_id}: "
+            f"detector={detector_offset_m} m, "
+            f"source={source_offset_m} m"
+        )
 
         n_projections = 2023
         chunk_angles = 32
@@ -467,14 +492,22 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         # Cone-beam FDK: g1
         g1_phase_m = torch.from_numpy(g1_phase_m).to(self.device)
-        reco_sub1 = self.reconstruct_cone(g1_phase_m)
+        reco_sub1 = self.reconstruct_cone(
+            g1_phase_m,
+            detector_offset_m=detector_offset_m,
+            source_offset_m=source_offset_m,
+        )
 
         del g1_phase_m
         torch.cuda.empty_cache()
 
         # Cone-beam FDK: g2
         g2_phase_m = torch.from_numpy(g2_phase_m).to(self.device)
-        reco_sub2 = self.reconstruct_cone(g2_phase_m)
+        reco_sub2 = self.reconstruct_cone(
+            g2_phase_m,
+            detector_offset_m=detector_offset_m,
+            source_offset_m=source_offset_m,
+        )
 
         del g2_phase_m
         torch.cuda.empty_cache()
@@ -497,10 +530,9 @@ class Neighbor2InverseSlice(pl.LightningModule):
             f"g2={tuple(reco_sub2.shape)}"
         )
 
-        # Temporary normalization statistics from the validated
-        # Mouse 9 cone-beam g1/g2 reconstructions.
-        cone_mean = 0.30336725
-        cone_std = 0.41892155
+        # stats calculated from mouse 5 and mouse 9
+        cone_mean = 0.2916252333219893
+        cone_std = 0.42268976769921446
 
         reco_sub1 = (reco_sub1 - cone_mean) / cone_std
         reco_sub2 = (reco_sub2 - cone_mean) / cone_std
@@ -566,11 +598,19 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         return loss
     def validation_step_cone(self, batch, batch_idx):
-        path_proj, scan_id = batch
+        path_proj, scan_id, detector_offset_m, source_offset_m = batch
 
-        # DataLoader batch size is 1, so unwrap the strings.
+        # DataLoader batch size is 1, so unwrap the values.
         path_proj = path_proj[0]
         scan_id = scan_id[0]
+        detector_offset_m = detector_offset_m[0].item()
+        source_offset_m = source_offset_m[0].item()
+
+        print(
+            f"Cone geometry for {scan_id}: "
+            f"detector={detector_offset_m} m, "
+            f"source={source_offset_m} m"
+        )
 
         n_projections = 2023
         chunk_angles = 32
@@ -667,14 +707,22 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         # Cone-beam FDK: g1
         g1_phase_m = torch.from_numpy(g1_phase_m).to(self.device)
-        reco_sub1 = self.reconstruct_cone(g1_phase_m)
+        reco_sub1 = self.reconstruct_cone(
+            g1_phase_m,
+            detector_offset_m=detector_offset_m,
+            source_offset_m=source_offset_m,
+        )
 
         del g1_phase_m
         torch.cuda.empty_cache()
 
         # Cone-beam FDK: g2
         g2_phase_m = torch.from_numpy(g2_phase_m).to(self.device)
-        reco_sub2 = self.reconstruct_cone(g2_phase_m)
+        reco_sub2 = self.reconstruct_cone(
+            g2_phase_m,
+            detector_offset_m=detector_offset_m,
+            source_offset_m=source_offset_m,
+        )
 
         del g2_phase_m
         torch.cuda.empty_cache()
@@ -697,10 +745,9 @@ class Neighbor2InverseSlice(pl.LightningModule):
             f"g2={tuple(reco_sub2.shape)}"
         )
 
-        # Temporary normalization statistics from the validated
-        # Mouse 9 cone-beam g1/g2 reconstructions.
-        cone_mean = 0.30336725
-        cone_std = 0.41892155
+        # stats calculated from mouse 5 and mouse 9
+        cone_mean = 0.2916252333219893
+        cone_std = 0.42268976769921446
 
         reco_sub1 = (reco_sub1 - cone_mean) / cone_std
         reco_sub2 = (reco_sub2 - cone_mean) / cone_std

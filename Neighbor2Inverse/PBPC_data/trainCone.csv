@@ -1,0 +1,3 @@
+path_proj,scan_id,detector_offset_m,source_offset_m
+/fs04/yd88/Lachie/data/n2i/Mouse_5_CT_W_NoFilter_50kVp_50W_SID1500mm_SOD500mm_exp150ms_CSM_THL0_5p9_THL1_10p1_dtheta0p178_rotspeed1p18dps/Projections_FAD.h5,Mouse_5,0.000627,0.0000165
+/fs04/yd88/Lachie/data/n2i/Mouse_9_CT_W_NoFilter_50kVp_50W_SID1500mm_SOD500mm_exp150ms_CSM_THL0_5p9_THL1_10p1_dtheta0p178_rotspeed1p18dps/Rotation_FAD.h5,Mouse_9,-0.001606,0.0
