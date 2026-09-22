@@ -518,11 +518,28 @@ class Neighbor2InverseSlice(pl.LightningModule):
             f"g2={tuple(reco_sub2.shape)}"
         )
 
-        # Select central axial slice for the first training smoke test.
-        middle_slice = reco_sub1.shape[0] // 2
+        valid_indices = torch.arange(
+            32,
+            reco_sub1.shape[0] - 32,
+            device=reco_sub1.device,
+        )
 
-        reco_sub1 = reco_sub1[middle_slice:middle_slice + 1]
-        reco_sub2 = reco_sub2[middle_slice:middle_slice + 1]
+        slice_indices = valid_indices[
+            torch.randperm(
+                valid_indices.numel(),
+                device=reco_sub1.device,
+            )[:8]
+        ]
+
+        slice_indices = torch.sort(slice_indices).values
+
+        print(
+            f"Training slice indices for {scan_id}: "
+            f"{slice_indices.tolist()}"
+        )
+
+        reco_sub1 = reco_sub1[slice_indices]
+        reco_sub2 = reco_sub2[slice_indices]
 
         print(
             f"Cone selected slices: "
@@ -536,22 +553,6 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         reco_sub1 = (reco_sub1 - cone_mean) / cone_std
         reco_sub2 = (reco_sub2 - cone_mean) / cone_std
-
-        # Temporary visual check of the integrated cone-beam reconstruction.
-        import os
-        import tifffile
-
-        os.makedirs("cone_smoke_outputs", exist_ok=True)
-
-        tifffile.imwrite(
-            f"cone_smoke_outputs/{scan_id}_g1_centre.tif",
-            reco_sub1[0].detach().float().cpu().numpy(),
-        )
-
-        tifffile.imwrite(
-            f"cone_smoke_outputs/{scan_id}_g2_centre.tif",
-            reco_sub2[0].detach().float().cpu().numpy(),
-        )
 
         print(
             f"Cone normalized slices: "
@@ -733,11 +734,20 @@ class Neighbor2InverseSlice(pl.LightningModule):
             f"g2={tuple(reco_sub2.shape)}"
         )
 
-        # Select central axial slice for the first training smoke test.
-        middle_slice = reco_sub1.shape[0] // 2
+        slice_indices = torch.linspace(
+            32,
+            reco_sub1.shape[0] - 33,
+            steps=8,
+            device=reco_sub1.device,
+        ).long()
 
-        reco_sub1 = reco_sub1[middle_slice:middle_slice + 1]
-        reco_sub2 = reco_sub2[middle_slice:middle_slice + 1]
+        print(
+            f"Validation slice indices for {scan_id}: "
+            f"{slice_indices.tolist()}"
+        )
+
+        reco_sub1 = reco_sub1[slice_indices]
+        reco_sub2 = reco_sub2[slice_indices]
 
         print(
             f"Cone selected slices: "
@@ -751,22 +761,6 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         reco_sub1 = (reco_sub1 - cone_mean) / cone_std
         reco_sub2 = (reco_sub2 - cone_mean) / cone_std
-
-        # Temporary visual check of the integrated cone-beam reconstruction.
-        import os
-        import tifffile
-
-        os.makedirs("cone_smoke_outputs", exist_ok=True)
-
-        tifffile.imwrite(
-            f"cone_smoke_outputs/{scan_id}_g1_centre.tif",
-            reco_sub1[0].detach().float().cpu().numpy(),
-        )
-
-        tifffile.imwrite(
-            f"cone_smoke_outputs/{scan_id}_g2_centre.tif",
-            reco_sub2[0].detach().float().cpu().numpy(),
-        )
 
         print(
             f"Cone normalized slices: "

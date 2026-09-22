@@ -1,0 +1,97 @@
+# general settings
+name: 'UNetSparse' #this name will appear as subfolder in the path
+base_network:
+  type: UNet
+  params:
+    in_nc: 1
+    out_nc: 1
+    residual: True
+    n_feature: 48
+
+
+scale: 1
+gpus: [3]
+manual_seed: 42
+
+# dataset and data loader settings
+dataset:
+  sparseSampling: 2 #1 means no subsampling, 2 means half the projections, 3 a third of the projections, ...
+  path_proj: '../../ProcessedData/projStitched/'
+  path_reco: False  #False if reconstruction has not been precomputed
+  n_slicesPR: 14 #number of slices to load for thickness retrieval
+  n_slices: 2 #number of slices to load. Should be 2 for proj subsampling and 1 for sinogram subsampling. Only needed for regularization term
+  exptime: 15ms
+  df_stats_path: './reco_stats.csv'
+dataset_train:
+    df_path: './trainCone.csv'
+
+dataset_val:
+    df_path: './valCone.csv'
+
+train_loader:
+    shuffle: True
+    num_workers: 2
+    batch_size: 1
+    prefetch_factor: 1
+    persistent_workers: True
+
+val_loader:
+    shuffle: False
+    num_workers: 2
+    batch_size: 1
+    prefetch_factor: 1
+    persistent_workers: True
+
+lightning_params:
+    Lambda1: 1.0
+    Lambda2: 1.0
+    increase_ratio: 2.0
+    n_epoch: 1
+    lr: 0.0005
+    gamma: 0.5
+    loss_type: 'mse'
+    regularizer: False
+    df_stats_path: './reco_stats.csv'
+    subsampling: 'projection'
+    doPhaseRetrieval: True
+    dataFidelity: False
+    coneBeam: True
+
+    PR_params:
+      delta: 4.2038e-7
+      beta: 2.4722e-10
+      pixel_size: 0.0366666667  # mm, effective object-plane pixel after Neighbor
+      energy: 23.94             # keV
+      z: 333.3333333            # mm, effective propagation distance
+      batchsizePR: 32
+
+    coneBeam_params:
+      total_rotation_deg: -360.272
+      source_origin_m: 0.5
+      origin_det_m: 1.0
+
+      true_pixel_size_m: 0.000110
+      rotation_offset_deg: 0.0
+
+      log_correction: False
+      pad_pixels: 100
+      short_scan: False
+      fbp_filter: "ram-lak"
+
+trainer_params:
+  accumulate_grad_batches: 1
+  precision: "bf16-mixed"
+  num_sanity_val_steps: 0 # avoid redundant cone-beam reconstruction before training
+
+
+optimizer_algo: 'Adam'
+optimizer_params:
+  weight_decay: 0
+
+scheduler_algo: 'ReduceLROnPlateau'
+scheduler_params:
+    factor: 0.5
+    patience: 5
+earlyStopping: False
+
+save_path: './model_weights/SubsampleProj/Sparse/'
