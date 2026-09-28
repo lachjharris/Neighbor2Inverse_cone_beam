@@ -46,8 +46,8 @@ lightning_params:
     Lambda1: 1.0
     Lambda2: 1.0
     increase_ratio: 2.0
-    n_epoch: 1
-    lr: 0.0005
+    n_epoch: 50
+    lr: 0.00005
     gamma: 0.5
     loss_type: 'mse'
     regularizer: False

@@ -309,8 +309,21 @@ class Neighbor2InverseSlice(pl.LightningModule):
         self.coneBeam = coneBeam
         self.coneBeam_params = coneBeam_params or {}
 
+        # Cone training reuses each expensive FDK volume for multiple
+        # genuine U-Net optimizer updates.
+        if self.coneBeam:
+            self.automatic_optimization = False
+
     def forward(self, x):
         return self.network(x)
+
+    def on_validation_epoch_end(self):
+        if self.coneBeam and self.trainer.sanity_checking is False:
+            scheduler = self.lr_schedulers()
+            val_loss = self.trainer.callback_metrics.get("val_loss")
+
+            if val_loss is not None:
+                scheduler.step(val_loss)
 
     def reconstruct_cone(
         self,
@@ -401,203 +414,263 @@ class Neighbor2InverseSlice(pl.LightningModule):
         chunk_angles = 32
         detector_rows = 512
 
+        # incorporating multiple mask generations per epoch
+        num_realizations = 4 # number of fresh masks to generate per epoch
+        mini_batch_size = 8  # number of slices to send through the network at once 
+
+        # Same 192 central slices as before.
+        valid_indices = torch.arange(
+            32,
+            detector_rows // 2 - 32,
+            device=self.device,
+        )
+
+        # Shuffle once, then divide into four non-overlapping groups of 48.
+        shuffled_indices = valid_indices[
+            torch.randperm(
+                valid_indices.numel(),
+                device=self.device,
+            )
+        ]
+
+        slice_groups = torch.chunk(
+            shuffled_indices,
+            num_realizations,
+        )
+
+        print(
+            f"Cone training for {scan_id}: "
+            f"{valid_indices.numel()} slices across "
+            f"{num_realizations} Neighbor realizations"
+        )
+
+        # Training-set normalization statistics from Mouse 5 + Mouse 9.
+        cone_mean = 0.2916252333219893
+        cone_std = 0.42268976769921446
+
+        optimizer = self.optimizers()
+        losses = []
+
         with h5py.File(path_proj, "r") as f:
             data = f["images"]
 
-            g1 = np.empty(
-                (n_projections, detector_rows // 2, data.shape[2] // 2),
-                dtype=np.float32,
-            )
-            g2 = np.empty_like(g1)
-
-            # Generate ONE Neighbor mask and reuse it for every angle.
             dummy = torch.from_numpy(
                 data[0:1, :detector_rows, :]
             ).unsqueeze(0)
 
-            mask1, mask2 = generate_mask_pair(dummy)
+            for realization_idx, slice_group in enumerate(
+                slice_groups,
+                start=1,
+            ):
+                print(
+                    f"Cone realization {realization_idx}/"
+                    f"{num_realizations} for {scan_id}: "
+                    f"{slice_group.numel()} slices"
+                )
 
-            for start in range(0, n_projections, chunk_angles):
-                stop = min(start + chunk_angles, n_projections)
+                g1 = np.empty(
+                    (
+                        n_projections,
+                        detector_rows // 2,
+                        data.shape[2] // 2,
+                    ),
+                    dtype=np.float32,
+                )
+                g2 = np.empty_like(g1)
 
-                projections = torch.from_numpy(
-                    data[start:stop, :detector_rows, :]
-                ).unsqueeze(0)
+                # Fresh Neighbor mask for this realization.
+                mask1, mask2 = generate_mask_pair(dummy)
 
-                sub1 = generate_subimages(projections, mask1)
-                sub2 = generate_subimages(projections, mask2)
+                # Reuse this realization's mask across all projection angles.
+                for start in range(
+                    0,
+                    n_projections,
+                    chunk_angles,
+                ):
+                    stop = min(
+                        start + chunk_angles,
+                        n_projections,
+                    )
 
-                g1[start:stop] = sub1[0].numpy()
-                g2[start:stop] = sub2[0].numpy()
+                    projections = torch.from_numpy(
+                        data[start:stop, :detector_rows, :]
+                    ).unsqueeze(0)
 
-        print(
-            f"Cone Neighbor pair for {scan_id}: "
-            f"g1={g1.shape}, g2={g2.shape}"
-        )
+                    sub1 = generate_subimages(
+                        projections,
+                        mask1,
+                    )
+                    sub2 = generate_subimages(
+                        projections,
+                        mask2,
+                    )
+
+                    g1[start:stop] = sub1[0].numpy()
+                    g2[start:stop] = sub2[0].numpy()
+
+                print(
+                    f"Cone Neighbor pair "
+                    f"{realization_idx}/{num_realizations}: "
+                    f"g1={g1.shape}, g2={g2.shape}"
+                )
 
                 # Paganin phase retrieval: g1
-        g1_gpu = torch.from_numpy(g1).to(self.device)
+                g1_gpu = torch.from_numpy(g1).to(self.device)
 
-        g1_phase_mm = compute_paganin_batch(
-            g1_gpu,
-            mu=self.mu,
-            sigma=self.sigma,
-            pixel_size=self.pixel_size,
-            batch_size=self.batchsizePR,
-        )
+                g1_phase_mm = compute_paganin_batch(
+                    g1_gpu,
+                    mu=self.mu,
+                    sigma=self.sigma,
+                    pixel_size=self.pixel_size,
+                    batch_size=self.batchsizePR,
+                )
 
-        # [angles, 1, rows, cols] -> [angles, rows, cols]
-        g1_phase_mm = g1_phase_mm[:, 0]
+                g1_phase_mm = g1_phase_mm[:, 0]
 
-        # projected thickness: mm -> m for ASTRA geometry
-        g1_phase_m = (
-            g1_phase_mm.detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-            * 1e-3
-        )
+                g1_phase_m = (
+                    g1_phase_mm.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    * 1e-3
+                )
 
-        del g1_gpu, g1_phase_mm, g1
-        torch.cuda.empty_cache()
+                del g1_gpu, g1_phase_mm, g1
+                torch.cuda.empty_cache()
 
-        # Paganin phase retrieval: g2
-        g2_gpu = torch.from_numpy(g2).to(self.device)
+                # Paganin phase retrieval: g2
+                g2_gpu = torch.from_numpy(g2).to(self.device)
 
-        g2_phase_mm = compute_paganin_batch(
-            g2_gpu,
-            mu=self.mu,
-            sigma=self.sigma,
-            pixel_size=self.pixel_size,
-            batch_size=self.batchsizePR,
-        )
+                g2_phase_mm = compute_paganin_batch(
+                    g2_gpu,
+                    mu=self.mu,
+                    sigma=self.sigma,
+                    pixel_size=self.pixel_size,
+                    batch_size=self.batchsizePR,
+                )
 
-        g2_phase_mm = g2_phase_mm[:, 0]
+                g2_phase_mm = g2_phase_mm[:, 0]
 
-        g2_phase_m = (
-            g2_phase_mm.detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-            * 1e-3
-        )
+                g2_phase_m = (
+                    g2_phase_mm.detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                    * 1e-3
+                )
 
-        del g2_gpu, g2_phase_mm, g2
-        torch.cuda.empty_cache()
+                del g2_gpu, g2_phase_mm, g2
+                torch.cuda.empty_cache()
 
+                print(
+                    f"Cone Paganin pair "
+                    f"{realization_idx}/{num_realizations}: "
+                    f"g1={g1_phase_m.shape}, "
+                    f"g2={g2_phase_m.shape}"
+                )
+
+                # Cone-beam FDK: g1
+                g1_phase_m = torch.from_numpy(
+                    g1_phase_m
+                ).to(self.device)
+
+                reco_sub1 = self.reconstruct_cone(
+                    g1_phase_m,
+                    detector_offset_m=detector_offset_m,
+                    source_offset_m=source_offset_m,
+                )
+
+                del g1_phase_m
+                torch.cuda.empty_cache()
+
+                # Cone-beam FDK: g2
+                g2_phase_m = torch.from_numpy(
+                    g2_phase_m
+                ).to(self.device)
+
+                reco_sub2 = self.reconstruct_cone(
+                    g2_phase_m,
+                    detector_offset_m=detector_offset_m,
+                    source_offset_m=source_offset_m,
+                )
+
+                del g2_phase_m
+                torch.cuda.empty_cache()
+
+                print(
+                    f"Cone FDK pair "
+                    f"{realization_idx}/{num_realizations}: "
+                    f"g1={tuple(reco_sub1.shape)}, "
+                    f"g2={tuple(reco_sub2.shape)}"
+                )
+
+                # Train only on this realization's 48 assigned slices.
+                for start in range(
+                    0,
+                    slice_group.numel(),
+                    mini_batch_size,
+                ):
+                    slice_indices = slice_group[
+                        start:start + mini_batch_size
+                    ]
+
+                    batch_sub1 = reco_sub1[slice_indices]
+                    batch_sub2 = reco_sub2[slice_indices]
+
+                    batch_sub1 = (
+                        batch_sub1 - cone_mean
+                    ) / cone_std
+                    batch_sub2 = (
+                        batch_sub2 - cone_mean
+                    ) / cone_std
+
+                    batch_sub1 = batch_sub1.unsqueeze(1)
+                    batch_sub2 = batch_sub2.unsqueeze(1)
+
+                    noisy_inpt, pad = pad_to_divisible(
+                        batch_sub1,
+                        32,
+                    )
+
+                    optimizer.zero_grad()
+
+                    noisy_output = self(noisy_inpt)
+                    noisy_output = unpad_from_divisible(
+                        noisy_output,
+                        pad,
+                    )
+
+                    loss = self.loss(
+                        noisy_output,
+                        batch_sub2,
+                    )
+
+                    self.manual_backward(loss)
+                    optimizer.step()
+
+                    losses.append(loss.detach())
+
+                # We no longer need this realization's volumes.
+                del reco_sub1, reco_sub2
+                torch.cuda.empty_cache()
+
+        mean_loss = torch.stack(losses).mean()
         print(
-            f"Cone Paganin pair: "
-            f"g1={g1_phase_m.shape}, g2={g2_phase_m.shape}"
-        )
-
-        # Cone-beam FDK: g1
-        g1_phase_m = torch.from_numpy(g1_phase_m).to(self.device)
-        reco_sub1 = self.reconstruct_cone(
-            g1_phase_m,
-            detector_offset_m=detector_offset_m,
-            source_offset_m=source_offset_m,
-        )
-
-        del g1_phase_m
-        torch.cuda.empty_cache()
-
-        # Cone-beam FDK: g2
-        g2_phase_m = torch.from_numpy(g2_phase_m).to(self.device)
-        reco_sub2 = self.reconstruct_cone(
-            g2_phase_m,
-            detector_offset_m=detector_offset_m,
-            source_offset_m=source_offset_m,
-        )
-
-        del g2_phase_m
-        torch.cuda.empty_cache()
-
-        print(
-            f"Cone FDK pair: "
-            f"g1={tuple(reco_sub1.shape)}, "
-            f"g2={tuple(reco_sub2.shape)}"
-        )
-
-        valid_indices = torch.arange(
-            32,
-            reco_sub1.shape[0] - 32,
-            device=reco_sub1.device,
-        )
-
-        slice_indices = valid_indices[
-            torch.randperm(
-                valid_indices.numel(),
-                device=reco_sub1.device,
-            )[:8]
-        ]
-
-        slice_indices = torch.sort(slice_indices).values
-
-        print(
-            f"Training slice indices for {scan_id}: "
-            f"{slice_indices.tolist()}"
-        )
-
-        reco_sub1 = reco_sub1[slice_indices]
-        reco_sub2 = reco_sub2[slice_indices]
-
-        print(
-            f"Cone selected slices: "
-            f"g1={tuple(reco_sub1.shape)}, "
-            f"g2={tuple(reco_sub2.shape)}"
-        )
-
-        # stats calculated from mouse 5 and mouse 9
-        cone_mean = 0.2916252333219893
-        cone_std = 0.42268976769921446
-
-        reco_sub1 = (reco_sub1 - cone_mean) / cone_std
-        reco_sub2 = (reco_sub2 - cone_mean) / cone_std
-
-        print(
-            f"Cone normalized slices: "
-            f"g1 mean/std={float(reco_sub1.mean()):.4f}/"
-            f"{float(reco_sub1.std()):.4f}, "
-            f"g2 mean/std={float(reco_sub2.mean()):.4f}/"
-            f"{float(reco_sub2.std()):.4f}"
-        )
-
-        # Add channel dimension:
-        # [1, H, W] -> [1, 1, H, W]
-        reco_sub1 = reco_sub1.unsqueeze(1)
-        reco_sub2 = reco_sub2.unsqueeze(1)
-
-        # Pad to a size compatible with the U-Net.
-        noisy_inpt, pad = pad_to_divisible(reco_sub1, 32)
-
-        # g1 reconstruction -> U-Net prediction
-        noisy_output = self(noisy_inpt)
-        noisy_output = unpad_from_divisible(noisy_output, pad)
-
-        # g2 reconstruction is the self-supervised target
-        noisy_target = reco_sub2
-
-        # Original non-regularized N2I loss
-        loss = self.loss(noisy_output, noisy_target)
-
-        print(
-            f"Cone U-Net: "
-            f"input={tuple(reco_sub1.shape)}, "
-            f"output={tuple(noisy_output.shape)}, "
-            f"target={tuple(noisy_target.shape)}, "
-            f"loss={float(loss):.6f}"
+            f"Cone U-Net training for {scan_id}: "
+            f"updates={len(losses)}, "
+            f"mean_loss={float(mean_loss):.6f}"
         )
 
         self.log(
             "train_loss",
-            loss,
+            mean_loss,
             on_epoch=True,
             sync_dist=True,
             prog_bar=True,
             batch_size=1,
         )
 
-        return loss
+        return mean_loss
     def validation_step_cone(self, batch, batch_idx):
         path_proj, scan_id, detector_offset_m, source_offset_m = batch
 
