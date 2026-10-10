@@ -1,5 +1,8 @@
-# general settings
-name: 'UNetSparse' #this name will appear as subfolder in the path
+# Neighbor2Inverse, cone-beam: projection subsampling, L_Nei (MSE) only.
+# Unsupported options (sinogram subsampling, L_reg, data fidelity, sparse
+# sampling) raise NotImplementedError in 1_trainNeighbor2Inverse.py.
+
+name: 'N2I_cone_projSub_LNei' # subfolder name under save_path
 base_network:
   type: UNet
   params:
@@ -8,20 +11,9 @@ base_network:
     residual: True
     n_feature: 48
 
-
-scale: 1
 gpus: [3]
-manual_seed: 42
 
-# dataset and data loader settings
-dataset:
-  sparseSampling: 2 #1 means no subsampling, 2 means half the projections, 3 a third of the projections, ...
-  path_proj: '../../ProcessedData/projStitched/'
-  path_reco: False  #False if reconstruction has not been precomputed
-  n_slicesPR: 14 #number of slices to load for thickness retrieval
-  n_slices: 2 #number of slices to load. Should be 2 for proj subsampling and 1 for sinogram subsampling. Only needed for regularization term
-  exptime: 15ms
-  df_stats_path: './reco_stats.csv'
+# dataset settings (one row per scan: path_proj, scan_id, detector_offset_m, source_offset_m)
 dataset_train:
     df_path: './trainCone.csv'
 
@@ -31,7 +23,7 @@ dataset_val:
 train_loader:
     shuffle: True
     num_workers: 2
-    batch_size: 1
+    batch_size: 1 # one scan per step; slices are mini-batched inside training_step_cone
     prefetch_factor: 1
     persistent_workers: True
 
@@ -43,46 +35,51 @@ val_loader:
     persistent_workers: True
 
 lightning_params:
+    coneBeam: True
+    subsampling: 'projection'
+    regularizer: False   # must be explicit: model default is True
+    dataFidelity: False
+    loss_type: 'mse'
+    doPhaseRetrieval: True
+    df_stats_path: './cone_stats.csv' # per-scan stats from 0_calculateStatsCone.py
+    n_epoch: 50
+    lr: 0.00005
+    val_mask_seed: 0      # validation uses a fixed Neighbor mask (seed + val scan index) every epoch
+    val_batch_size: 8     # validation slices per forward pass (all 192 central slices are evaluated)
+    # Diagnostic snapshots (weights, Adam state, grads, batch) saved right BEFORE these optimizer
+    # updates, matching the "update ... step=N" log lines. Empty list or remove to disable.
+    # 552: last Mouse_9 update before the e11 spike; 553: spike onset (first Mouse_5 update);
+    # 554, 556, 564: into the spike; 576: last spike update; 577, 578: recovery (e12 Mouse_5).
+    snapshot_steps: [552, 553, 554, 556, 564, 576, 577, 578]
+
+    # Required by the Neighbor2InverseSlice signature; only used by L_reg, so unused here.
     Lambda1: 1.0
     Lambda2: 1.0
     increase_ratio: 2.0
-    n_epoch: 50
-    lr: 0.00005
-    gamma: 0.5
-    loss_type: 'mse'
-    regularizer: False
-    df_stats_path: './reco_stats.csv'
-    subsampling: 'projection'
-    doPhaseRetrieval: True
-    dataFidelity: False
-    coneBeam: True
 
     PR_params:
       delta: 4.2038e-7
       beta: 2.4722e-10
-      pixel_size: 0.0366666667  # mm, effective object-plane pixel after Neighbor
+      pixel_size: 0.0366666667  # mm, object-plane pixel of the subsampled projections: (2 x 55 um) / M, M = 3
       energy: 23.94             # keV
-      z: 333.3333333            # mm, effective propagation distance
+      z: 333.3333333            # mm, effective propagation distance: SOD*ODD / SID
       batchsizePR: 32
 
     coneBeam_params:
       total_rotation_deg: -360.272
       source_origin_m: 0.5
       origin_det_m: 1.0
-
-      true_pixel_size_m: 0.000110
+      true_pixel_size_m: 0.000110  # detector pixel of the subsampled projections (2 x 55 um native)
       rotation_offset_deg: 0.0
-
-      log_correction: False
+      log_correction: False        # projections are already Paganin thickness maps
       pad_pixels: 100
       short_scan: False
       fbp_filter: "ram-lak"
 
 trainer_params:
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 1 # must be 1: cone path uses manual optimization
   precision: "bf16-mixed"
-  num_sanity_val_steps: 0 # avoid redundant cone-beam reconstruction before training
-
+  num_sanity_val_steps: 0    # avoid a redundant cone-beam reconstruction before training
 
 optimizer_algo: 'Adam'
 optimizer_params:
@@ -94,4 +91,14 @@ scheduler_params:
     patience: 5
 earlyStopping: False
 
-save_path: './model_weights/SubsampleProj/Sparse/'
+save_path: './model_weights/Cone/'
+
+# Progress images: one slice of a saved full-res reconstruction (0_calculateStatsCone.py --save_dir)
+# will display (from left to right): input -> prediction -> input-prediction
+# upstream implementation had a high dose (low noise) reference image on the RHS panel
+# could consider also doing this 
+prediction_callback:
+    volume_path: './full_recons/Mouse_10_reco_fullres.npy'
+    scan_id: 'Mouse_10'      # must match a row in cone_stats.csv
+    slice_idx: 340          # null -> central slice
+    show_residual: True      # third panel: input - prediction

@@ -15,18 +15,48 @@ from copy import deepcopy
 import argparse
 from network import UNet
 from lightning.pytorch.callbacks.early_stopping import EarlyStopping
-from utils_callback import SavePredictionCallback, SavePredictionCallbackSlice, SaveHyperparametersCallback
+from utils_callback import SavePredictionCallback, SavePredictionCallbackSlice, SavePredictionCallbackCone, SaveHyperparametersCallback
 
 torch.set_float32_matmul_precision('medium')
 
+
+def check_cone_config(trainparams):
+    """
+    The cone-beam path currently implements only projection subsampling
+    with the Neighbor loss (L_Nei, MSE). Fail loudly on anything else
+    instead of silently ignoring it.
+    """
+    lp = trainparams['lightning_params']
+    unsupported = []
+
+    if lp.get('subsampling', 'projection') != 'projection':
+        unsupported.append(f"subsampling='{lp['subsampling']}' (only 'projection')")
+    if lp.get('regularizer', True):  # model default is True, so require an explicit False
+        unsupported.append("regularizer=True (L_reg)")
+    if lp.get('dataFidelity', False):
+        unsupported.append("dataFidelity=True")
+    if lp.get('loss_type', 'mse') != 'mse':
+        unsupported.append(f"loss_type='{lp['loss_type']}' (only 'mse')")
+    if trainparams.get('dataset', {}).get('sparseSampling', 1) != 1:
+        unsupported.append("sparseSampling != 1")
+
+    if unsupported:
+        raise NotImplementedError(
+            "Cone-beam training does not support: " + "; ".join(unsupported)
+        )
+
+
 def main(trainparams):
     pl.seed_everything(42)
+    is_cone = trainparams['lightning_params'].get('coneBeam', False)
+    if is_cone:
+        check_cone_config(trainparams)
 
     print("Let's go!", chr(sum(range(ord(min(str(not())))))))
     print(trainparams)
     
     # ----- initialize dataset -----
-    if trainparams['lightning_params'].get('coneBeam', False):
+    if is_cone:
 
         dataset_train = ConeBeamProjDataset(
             **trainparams['dataset_train']
@@ -74,7 +104,7 @@ def main(trainparams):
                         scheduler_algo =  trainparams["scheduler_algo"],
                         optimizer_params = trainparams["optimizer_params"],
                         scheduler_params = trainparams["scheduler_params"],
-                        n_slicesPR = trainparams["dataset"]['n_slicesPR'],
+                        n_slicesPR = trainparams.get("dataset", {}).get('n_slicesPR'),
                         )
         
     elif trainparams['lightning_params']['dataFidelity'] == True:
@@ -88,7 +118,10 @@ def main(trainparams):
                         )
     
     # -----  define callbacks/loggers -----
-    save_path = os.path.abspath(trainparams['save_path'] + f"/{trainparams['dataset']['exptime']}Sparse{int(trainparams['dataset']['sparseSampling'])}/{trainparams['name']}/")
+    if is_cone:
+        save_path = os.path.abspath(trainparams['save_path'] + f"/{trainparams['name']}/")
+    else:
+        save_path = os.path.abspath(trainparams['save_path'] + f"/{trainparams['dataset']['exptime']}Sparse{int(trainparams['dataset']['sparseSampling'])}/{trainparams['name']}/")
 
     lr_monitor = pl.pytorch.callbacks.LearningRateMonitor(logging_interval='epoch') 
     tblogger = pl.pytorch.loggers.TensorBoardLogger(save_path) 
@@ -101,7 +134,12 @@ def main(trainparams):
         early_stopping = pl.pytorch.callbacks.EarlyStopping(monitor="val_loss", patience=10000) #dummy callback, will never trigger
 
     #init image logger
-    if trainparams['dataset']['path_reco'] is False:
+    if is_cone:
+        prediction_callback = SavePredictionCallbackCone(
+            output_dir=save_path + f"/lightning_logs/version_{tblogger.version}/predictions/",
+            **trainparams['prediction_callback'],
+        )
+    elif trainparams['dataset']['path_reco'] is False:
         #load presaved test image
         
         prediction_callback = SavePredictionCallback(output_dir=save_path + f"/lightning_logs/version_{tblogger.version}/predictions/", 
@@ -116,7 +154,7 @@ def main(trainparams):
     
     # -----  init trainer and start training -----
     trainer = pl.Trainer(logger=[csvlogger, tblogger], 
-                        callbacks=[lr_monitor, checkpoint, savetrainparams_callback, prediction_callback, early_stopping],
+                        callbacks=[cb for cb in [lr_monitor, checkpoint, savetrainparams_callback, prediction_callback, early_stopping] if cb is not None],
                         max_epochs=trainparams['lightning_params']['n_epoch'],
                         accelerator='gpu',
                         devices=trainparams['gpus'], 
@@ -139,6 +177,8 @@ if __name__ == '__main__':
         trainparams = yaml.safe_load(f)
 
     # Override parameters if provided
+    if args.exptime is not None or args.sparseSampling is not None:
+        trainparams.setdefault('dataset', {})
     if args.exptime is not None:
         trainparams['dataset']['exptime'] = args.exptime
     if args.sparseSampling is not None:

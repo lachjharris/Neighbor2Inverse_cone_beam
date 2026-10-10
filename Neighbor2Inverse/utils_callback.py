@@ -181,6 +181,84 @@ class SavePredictionCallback(Callback):
         # Switch back to training mode
         pl_module.train()
 
+class SavePredictionCallbackCone(Callback):
+    """
+    Cone-beam counterpart of SavePredictionCallback: at train start and after every
+    validation epoch, denoise one slice of a saved FULL-RESOLUTION reconstruction
+    (from 0_calculateStatsCone.py --save_dir) and save [input, prediction, residual].
+
+    There is no high-dose reference for the cone data, so the residual
+    (input - prediction) takes the place of upstream's reference panel: it should
+    look like structureless noise; visible anatomy means structure is being removed.
+    """
+    def __init__(self, output_dir, volume_path, scan_id, slice_idx=None, show_residual=True):
+        super().__init__()
+        if not os.path.exists(volume_path):
+            raise FileNotFoundError(f"Full-res reconstruction not found: {volume_path}")
+
+        volume = np.load(volume_path, mmap_mode='r')  # [slice, y, x]; only one slice is read
+        if slice_idx is None:
+            slice_idx = volume.shape[0] // 2  # central slice: least cone-beam artefact
+        self.slice = np.array(volume[slice_idx], dtype=np.float32)
+        del volume
+
+        # Display window is taken from inside the circular FOV only,
+        # so the zeroed corners don't bias mean/std.
+        self.fov = self.slice != 0
+
+        self.output_dir = output_dir
+        self.scan_id = scan_id
+        self.slice_idx = slice_idx
+        self.show_residual = show_residual
+        os.makedirs(output_dir, exist_ok=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self.save_current_progress(trainer, pl_module, "epoch")
+
+    def on_train_start(self, trainer, pl_module):
+        if trainer.is_global_zero:
+            self.save_current_progress(trainer, pl_module, "start")
+
+    @staticmethod
+    def _window(img, fov, n_std=3):
+        vals = img[fov]
+        mn, std = vals.mean(), vals.std()
+        return normalize_to_range(img, vmin=mn - n_std * std, vmax=mn + n_std * std)
+
+    def save_current_progress(self, trainer, pl_module, name):
+        from modelLightning import pad_to_divisible, unpad_from_divisible
+
+        was_training = pl_module.training
+        pl_module.eval()
+
+        input_image = torch.from_numpy(self.slice).to(pl_module.device)[None, None]  # [1, 1, H, W]
+        input_image = pl_module.normalize_cone(input_image, self.scan_id)
+
+        with torch.no_grad():
+            inpt_pad, pad = pad_to_divisible(input_image, 32)
+            predicted_image = unpad_from_divisible(pl_module(inpt_pad), pad)
+
+        inpt = input_image[0].float().cpu()      # [1, H, W]
+        pred = predicted_image[0].float().cpu()
+        fov = torch.from_numpy(self.fov)[None]
+
+        # Input and prediction share one window (from the input), as upstream.
+        vals = inpt[fov]
+        vmin, vmax = vals.mean() - 3 * vals.std(), vals.mean() + 3 * vals.std()
+        img_list = [normalize_to_range(img, vmin=vmin, vmax=vmax) for img in (inpt, pred)]
+        if self.show_residual:
+            img_list.append(self._window(inpt - pred, fov))
+
+        save_image(img_list, os.path.join(
+            self.output_dir,
+            f"{name}_{trainer.current_epoch}_{self.scan_id}_slice{self.slice_idx}_progress.png",
+        ))
+
+        if was_training:
+            pl_module.train()
+
+
 class SaveHyperparametersCallback(Callback):
     def __init__(self, output_dir, file):
         super().__init__()
