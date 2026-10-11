@@ -23,6 +23,9 @@ rise by ~7% between steps 10 and 50. This script reproduces that behaviour for t
 official suggestion, and additionally records a correctly bias-corrected curve
 (loss_smoothed_corrected) with its own suggestion as a cross-check.
 
+Autocast runs with its weight cache disabled (as training_step_cone does per update), so
+every forward pass uses the current weights.
+
 The training data path is the same as training_step_cone: shuffled training scans,
 CONE_NUM_REALIZATIONS fresh Neighbor masks per scan, CONE_MINI_BATCH_SIZE slices per
 optimizer step, per-scan normalization, the optimizer from configure_optimizers, and
@@ -93,7 +96,10 @@ def lightning_suggestion(lrs, smoothed_losses):
 def autocast_context(precision, device):
     precision = str(precision)
     if precision == "bf16-mixed":
-        return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        # cache_enabled=False: this context spans many optimizer steps, and autocast's
+        # weight cache is not refreshed after optimizer.step(), so with the cache on every
+        # forward would reuse the weights from the first step of the scan.
+        return torch.autocast(device_type=device.type, dtype=torch.bfloat16, cache_enabled=False)
     if precision in ("32", "32-true"):
         return contextlib.nullcontext()
     raise NotImplementedError(f"LR range test does not handle precision '{precision}'")

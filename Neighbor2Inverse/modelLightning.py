@@ -1,5 +1,6 @@
 import lightning as pl
 import os
+import contextlib
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -382,8 +383,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
             if val_loss is not None:
                 scheduler.step(val_loss)
         
-        lr = scheduler.optimizer.param_groups[0]["lr"]
-        print(f"Epoch {self.current_epoch}: val_loss = {val_loss}, learning rate = {lr:.3e}")
+            lr = scheduler.optimizer.param_groups[0]["lr"]
+            print(f"Epoch {self.current_epoch}: val_loss = {val_loss}, learning rate = {lr:.3e}")
 
     def normalize_cone(self, inpt, scan_id):
         """
@@ -678,6 +679,22 @@ class Neighbor2InverseSlice(pl.LightningModule):
         )
         print(f"  snapshot saved before update {update_step}: {path}")
 
+    def _step_autocast(self):
+        """
+        Autocast context for ONE optimizer step: same settings as the active (Lightning)
+        autocast, but with the weight cache disabled.
+
+        Lightning runs the whole training_step inside one autocast context. Autocast caches
+        the low-precision copy of each weight on first use and does not refresh it after
+        optimizer.step() updates the weights in place, so without this every forward/backward
+        in a scan pass would use the weights from the pass's first update.
+        """
+        if self.device.type == "cuda" and torch.is_autocast_enabled():
+            return torch.autocast("cuda", dtype=torch.get_autocast_gpu_dtype(), cache_enabled=False)
+        if self.device.type == "cpu" and torch.is_autocast_cpu_enabled():
+            return torch.autocast("cpu", dtype=torch.get_autocast_cpu_dtype(), cache_enabled=False)
+        return contextlib.nullcontext()
+
     def training_step_cone(self, batch, batch_idx):
         path_proj, scan_id, detector_offset_m, source_offset_m = self._unpack_cone_batch(batch)
 
@@ -740,10 +757,11 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
                     optimizer.zero_grad()
 
-                    noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
-                    loss = self.loss(noisy_output, batch_sub2)
-
-                    self.manual_backward(loss)
+                    # Fresh autocast context per update, so the forward uses the current weights.
+                    with self._step_autocast():
+                        noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
+                        loss = self.loss(noisy_output, batch_sub2)
+                        self.manual_backward(loss)
                     grad_norm = self._grad_norm()  # before the step, i.e. the gradient this update uses
 
                     # Output decomposition for this batch (same output the loss used):
