@@ -42,15 +42,15 @@ lightning_params:
     loss_type: 'mse'
     doPhaseRetrieval: True
     df_stats_path: './cone_stats.csv' # per-scan stats from 0_calculateStatsCone.py
-    n_epoch: 50
-    lr: 0.00005
+    n_epoch: 13
+    lr: 0.0005
     val_mask_seed: 0      # validation uses a fixed Neighbor mask (seed + val scan index) every epoch
     val_batch_size: 8     # validation slices per forward pass (all 192 central slices are evaluated)
     # Diagnostic snapshots (weights, Adam state, grads, batch) saved right BEFORE these optimizer
     # updates, matching the "update ... step=N" log lines. Empty list or remove to disable.
     # 552: last Mouse_9 update before the e11 spike; 553: spike onset (first Mouse_5 update);
     # 554, 556, 564: into the spike; 576: last spike update; 577, 578: recovery (e12 Mouse_5).
-    snapshot_steps: [552, 553, 554, 556, 564, 576, 577, 578]
+    snapshot_steps: [] #[552, 553, 554, 556, 564, 576, 577, 578]
 
     # Required by the Neighbor2InverseSlice signature; only used by L_reg, so unused here.
     Lambda1: 1.0
