@@ -181,7 +181,7 @@ def main():
 
     while not stop:
         for batch in loader:
-            path_proj, scan_id, det_off, src_off = model._unpack_cone_batch(batch)
+            path_proj, scan_id, det_off, src_off, _ = model._unpack_cone_batch(batch)
 
             with autocast_context(precision, device):
                 slice_groups = model.cone_training_slice_groups()

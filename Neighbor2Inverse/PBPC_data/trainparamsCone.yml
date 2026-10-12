@@ -13,7 +13,7 @@ base_network:
 
 gpus: [3]
 
-# dataset settings (one row per scan: path_proj, scan_id, detector_offset_m, source_offset_m)
+# dataset settings (one row per scan: path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres)
 dataset_train:
     df_path: './trainCone.csv'
 

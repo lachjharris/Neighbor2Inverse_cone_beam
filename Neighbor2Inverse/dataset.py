@@ -208,7 +208,9 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
     """
     Dataset for cone-beam N2I scans.
 
-    Returns the HDF5 path, scan identifier, and scan-specific cone-beam offsets.
+    Returns the HDF5 path, scan identifier, scan-specific cone-beam offsets, and
+    the path of the scan's full-resolution reconstruction (.npy, from
+    0_calculateStatsCone.py --save_dir; the denoised input of L_reg's correction term).
     Projection data are streamed from HDF5 inside the cone-beam
     reconstruction path rather than loaded into RAM by the DataLoader.
     """
@@ -224,11 +226,22 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
         for column in [
             "detector_offset_m",
             "source_offset_m",
+            "path_reco_fullres",
         ]:
             if column not in self.df.columns:
                 raise ValueError(
                     f"ConeBeamProjDataset CSV must contain a '{column}' column"
                 )
+
+        # Fail at startup, not hours into a run, if a full-res reconstruction is missing.
+        missing = [
+            str(p) for p in self.df["path_reco_fullres"]
+            if not os.path.isfile(str(p))
+        ]
+        if missing:
+            raise FileNotFoundError(
+                f"path_reco_fullres file(s) not found in {df_path}: {missing}"
+            )
 
     def __len__(self):
         return len(self.df)
@@ -252,11 +265,14 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
             row["source_offset_m"]
         )
 
+        path_reco_fullres = str(row["path_reco_fullres"])
+
         return (
             path_proj,
             scan_id,
             detector_offset_m,
             source_offset_m,
+            path_reco_fullres,
         )
 
 class ClinicalDataset(torch.utils.data.Dataset):

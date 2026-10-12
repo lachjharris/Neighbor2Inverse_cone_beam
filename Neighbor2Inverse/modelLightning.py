@@ -483,12 +483,13 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
     def _unpack_cone_batch(self, batch):
         """Unwrap a cone DataLoader batch (batch size 1)."""
-        path_proj, scan_id, detector_offset_m, source_offset_m = batch
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = batch
         return (
             path_proj[0],
             scan_id[0],
             detector_offset_m[0].item(),
             source_offset_m[0].item(),
+            path_reco_fullres[0],
         )
 
     def cone_slice_indices(self, n_slices):
@@ -696,7 +697,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         return contextlib.nullcontext()
 
     def training_step_cone(self, batch, batch_idx):
-        path_proj, scan_id, detector_offset_m, source_offset_m = self._unpack_cone_batch(batch)
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = self._unpack_cone_batch(batch)
 
         print(
             f"Cone geometry for {scan_id}: "
@@ -836,7 +837,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         return mean_loss
 
     def validation_step_cone(self, batch, batch_idx):
-        path_proj, scan_id, detector_offset_m, source_offset_m = self._unpack_cone_batch(batch)
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = self._unpack_cone_batch(batch)
 
         print(
             f"Cone geometry for {scan_id}: "
