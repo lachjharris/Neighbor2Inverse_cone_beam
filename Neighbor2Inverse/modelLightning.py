@@ -11,7 +11,7 @@ from torchvision.utils import save_image
 from torch_radon import Radon, RadonFanbeam
 import pandas as pd
 from utilForwardProp import propTIE_torch
-from astra_cone_array import astra_cone_from_array # our cone beam reconstructor
+from astra_cone_array import astra_cone_from_array, astra_cone_forward_from_volume # our cone beam FDK / forward projector
 import h5py
 
 torch.autograd.set_detect_anomaly(True)
@@ -400,6 +400,17 @@ class Neighbor2InverseSlice(pl.LightningModule):
         mean, std = row[["mean", "std"]].values[0]
         return (inpt - float(mean)) / float(std)
 
+    def cone_scan_stats(self, scan_id):
+        """(mean, std) of the scan's full-resolution reconstruction, as used by normalize_cone."""
+        row = self.df_stats[self.df_stats["scan_id"].astype(str) == str(scan_id)]
+        if len(row) != 1:
+            raise KeyError(
+                f"Expected exactly one stats row for scan_id '{scan_id}', found {len(row)}. "
+                f"Run 0_calculateStatsCone.py for this scan."
+            )
+        mean, std = row[["mean", "std"]].values[0]
+        return float(mean), float(std)
+
     def reconstruct_cone(
         self,
         projections,
@@ -533,7 +544,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         torch.cuda.empty_cache()
         return thickness_m
 
-    def make_cone_pair(self, data, detector_offset_m, source_offset_m, generator=None, tag=""):
+    def make_cone_pair(self, data, detector_offset_m, source_offset_m, generator=None, tag="", return_masks=False):
         """
         One Neighbor realization for cone-beam Neighbor2Inverse:
         projections -> Neighbor subsampling (one mask, shared by all angles)
@@ -546,9 +557,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 global seed counter (training); a seeded generator gives a reproducible
                 mask (validation).
             tag: label for the diagnostic prints (e.g. "e11 Mouse_5 r1").
+            return_masks: also return this realization's Neighbor masks (needed by L_reg,
+                which subsamples the forward-projected denoised volume with the same masks).
 
         Returns:
-            (reco_sub1, reco_sub2): un-normalized half-resolution volumes on self.device.
+            (reco_sub1, reco_sub2): un-normalized half-resolution volumes on self.device,
+            or (reco_sub1, reco_sub2, (mask1, mask2)) if return_masks.
         """
         n_projections = self.CONE_N_PROJECTIONS
         detector_rows = self.CONE_DETECTOR_ROWS
@@ -620,7 +634,119 @@ class Neighbor2InverseSlice(pl.LightningModule):
         )
         print(f"  diag {tag} fdk     g1: {summary_stats(reco_sub1)}")
         print(f"  diag {tag} fdk     g2: {summary_stats(reco_sub2)}")
+        if return_masks:
+            return reco_sub1, reco_sub2, (mask1, mask2)
         return reco_sub1, reco_sub2
+
+    # ------------------------------------------------------------------
+    # L_reg for the cone path (Neighbor2Inverse Eq. 7, Huang et al. Eq. 7)
+    # ------------------------------------------------------------------
+
+    def cone_reg_weight(self):
+        """Upstream's L_reg weight schedule: 0 at epoch 0, increase_ratio * (n_epoch - 1) / n_epoch at the end."""
+        return self.current_epoch / self.n_epoch * self.increase_ratio
+
+    def load_fullres_cone(self, path_reco_fullres):
+        """Full-res reconstruction R[T p] (input of f(y)), from 0_calculateStatsCone.py --save_dir."""
+        volume = np.load(path_reco_fullres).astype(np.float32, copy=False)
+        expected = (self.CONE_DETECTOR_ROWS, volume.shape[1], volume.shape[1])
+        if volume.ndim != 3 or volume.shape != expected:
+            raise ValueError(
+                f"{path_reco_fullres}: full-res volume shape {volume.shape}, expected {expected} "
+                f"(regenerate with 0_calculateStatsCone.py --save_dir)"
+            )
+        return volume
+
+    def denoise_fullres_cone(self, volume, scan_id):
+        """
+        f(y): denoise every slice of the full-res volume with the CURRENT weights, no gradients,
+        one slice per forward pass (larger batches are no faster; see time_cone_fullres_denoise.py).
+        Same preprocessing as the training input: normalize_cone, reflect-pad to 32, unpad.
+        Returns un-normalized (physical units) float32 numpy array, same shape as volume.
+        """
+        mean, std = self.cone_scan_stats(scan_id)
+        denoised = np.empty_like(volume)
+        with torch.no_grad():
+            for z in range(volume.shape[0]):
+                x = torch.from_numpy(volume[z:z + 1]).to(self.device)[:, None]
+                x = (x - mean) / std
+                x_pad, pad = pad_to_divisible(x, 32)
+                with self._step_autocast():
+                    y = unpad_from_divisible(self(x_pad), pad)
+                denoised[z] = (y.float() * std + mean)[0, 0].cpu().numpy()
+        del x, x_pad, y
+        return denoised
+
+    def cone_reg_correction(self, volume, scan_id, masks, detector_offset_m, source_offset_m, tag=""):
+        """
+        Correction term of L_reg for one Neighbor realization (no gradients):
+            exp_diff = normalize(R g1(R^-1 f(y))) - normalize(R g2(R^-1 f(y)))
+        f(y): full-res volume denoised with the current weights; R^-1: cone forward projection
+        (full-res geometry); g1/g2: this realization's masks; R: FDK in the training geometry.
+        No Paganin: the denoised volume is a thickness reconstruction, so its forward
+        projection is already projected thickness (as upstream).
+
+        Returns:
+            exp_diff [half-res slices, y, x] float32 on self.device, in normalized units
+            (the scan mean cancels, so this equals normalize_cone(C1) - normalize_cone(C2)).
+        """
+        mask1, mask2 = masks
+        mean, std = self.cone_scan_stats(scan_id)
+        n_projections = self.CONE_N_PROJECTIONS
+        detector_rows = self.CONE_DETECTOR_ROWS
+        n_cols = volume.shape[2]
+
+        # f(y) with the current weights
+        denoised = self.denoise_fullres_cone(volume, scan_id)
+        print(f"  diag {tag} reg     f(y): {summary_stats(denoised)}")
+        torch.cuda.empty_cache()  # leave the GPU to ASTRA
+
+        # R^-1: full-res geometry (factor 2 finer than the training geometry)
+        cp = self.coneBeam_params
+        forward = astra_cone_forward_from_volume(
+            denoised,
+            num_projections=n_projections,
+            detector_rows=detector_rows,
+            detector_cols=n_cols,
+            total_rotation_deg=cp["total_rotation_deg"],
+            source_origin_m=cp["source_origin_m"],
+            origin_det_m=cp["origin_det_m"],
+            true_pixel_size_m=cp["true_pixel_size_m"] / self.factor,
+            rotation_offset_deg=cp.get("rotation_offset_deg"),
+            horizontal_detector_offset_m=float(detector_offset_m),
+            horizontal_source_offset_m=float(source_offset_m),
+        )
+        del denoised
+
+        # g1, g2: the realization's masks, applied to every angle as in make_cone_pair
+        f1 = np.empty((n_projections, detector_rows // 2, n_cols // 2), dtype=np.float32)
+        f2 = np.empty_like(f1)
+        for start in range(0, n_projections, self.CONE_CHUNK_ANGLES):
+            stop = min(start + self.CONE_CHUNK_ANGLES, n_projections)
+            chunk = torch.from_numpy(forward[start:stop]).unsqueeze(0)
+            f1[start:stop] = generate_subimages(chunk, mask1)[0].numpy()
+            f2[start:stop] = generate_subimages(chunk, mask2)[0].numpy()
+        del forward, chunk
+
+        # R: FDK in the training geometry (as the training pairs, without Paganin)
+        c1 = self.reconstruct_cone(torch.from_numpy(f1), detector_offset_m=detector_offset_m,
+                                   source_offset_m=source_offset_m).to(self.device)
+        del f1
+        c2 = self.reconstruct_cone(torch.from_numpy(f2), detector_offset_m=detector_offset_m,
+                                   source_offset_m=source_offset_m).to(self.device)
+        del f2
+
+        exp_diff = (c1 - c2) / std
+        del c1, c2
+        torch.cuda.empty_cache()
+
+        central = exp_diff[self.cone_slice_indices(exp_diff.shape[0])]
+        print(
+            f"  diag {tag} reg     exp_diff (central slices): mean={float(central.mean()):+.5f} "
+            f"rms={float(central.pow(2).mean().sqrt()):.5f} max_abs={float(central.abs().max()):.4f}"
+        )
+        del central
+        return exp_diff
 
     def _grad_norm(self):
         """
@@ -723,6 +849,13 @@ class Neighbor2InverseSlice(pl.LightningModule):
         optimizer = self.optimizers()
         losses = []
 
+        # L_reg (upstream schedule; computed from epoch 0 even though its weight is 0 there).
+        if self.regularizer:
+            reg_weight = self.cone_reg_weight()
+            losses_nei, losses_reg = [], []
+            fullres_volume = self.load_fullres_cone(path_reco_fullres)  # f(y) input, reused by all realizations
+            print(f"Cone L_reg for {scan_id}: weight={reg_weight:.4f}, full-res input {fullres_volume.shape}")
+
         with h5py.File(path_proj, "r") as f:
             data = f["images"]
 
@@ -735,9 +868,20 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
                 # Fresh Neighbor mask for this realization.
                 tag = f"e{self.current_epoch} {scan_id} r{realization_idx}"
-                reco_sub1, reco_sub2 = self.make_cone_pair(
-                    data, detector_offset_m, source_offset_m, tag=tag
-                )
+                if self.regularizer:
+                    reco_sub1, reco_sub2, masks = self.make_cone_pair(
+                        data, detector_offset_m, source_offset_m, tag=tag, return_masks=True
+                    )
+                    # Correction term with the weights at the start of this realization,
+                    # reused (as a constant) by its updates.
+                    exp_diff = self.cone_reg_correction(
+                        fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag
+                    )
+                    del masks
+                else:
+                    reco_sub1, reco_sub2 = self.make_cone_pair(
+                        data, detector_offset_m, source_offset_m, tag=tag
+                    )
 
                 # Network-independent check of this realization's training pairs:
                 # identity_mse is the loss an identity network would get on these 48 slices.
@@ -764,7 +908,15 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     # Fresh autocast context per update, so the forward uses the current weights.
                     with self._step_autocast():
                         noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
-                        loss = self.loss(noisy_output, batch_sub2)
+                        if self.regularizer:
+                            # Upstream: loss = Lambda1*L_Nei + Lambda2*w*L_reg; exp_diff carries no gradient.
+                            diff = noisy_output.float() - batch_sub2.float()
+                            loss_nei = torch.mean(diff ** 2)
+                            loss_reg = torch.mean((diff - exp_diff[slice_indices].unsqueeze(1)) ** 2)
+                            loss = self.Lambda1 * loss_nei + self.Lambda2 * reg_weight * loss_reg
+                            del diff
+                        else:
+                            loss = self.loss(noisy_output, batch_sub2)
                         self.manual_backward(loss)
                     grad_norm = self._grad_norm()  # before the step, i.e. the gradient this update uses
 
@@ -803,6 +955,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     del params_before
 
                     losses.append(loss.detach())
+                    reg_msg = ""
+                    if self.regularizer:
+                        losses_nei.append(loss_nei.detach())
+                        losses_reg.append(loss_reg.detach())
+                        reg_msg = f" nei={loss_nei.item():.6f} reg={loss_reg.item():.6f} w={reg_weight:.4f}"
+                        del loss_nei, loss_reg
 
                     # Per-update diagnostics (grep "update e<epoch> <scan>" in the .out file).
                     loss_value = loss.item()
@@ -810,7 +968,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     print(
                         f"  update e{self.current_epoch} {scan_id} "
                         f"r{realization_idx} b{start // mini_batch_size + 1}: "
-                        f"step={self.global_step} loss={loss_value:.6f} "
+                        f"step={self.global_step} loss={loss_value:.6f}{reg_msg} "
                         f"grad_norm={grad_norm:.4e} "
                         f"err_mean={err_mean:+.4f} err_std={err_std:.4f} "
                         f"res_mean={res_mean:+.4f} res_std={res_std:.4f} "
@@ -819,7 +977,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
                 # We no longer need this realization's volumes.
                 del reco_sub1, reco_sub2
+                if self.regularizer:
+                    del exp_diff
                 torch.cuda.empty_cache()
+
+        if self.regularizer:
+            del fullres_volume
 
         mean_loss = torch.stack(losses).mean()
         print(
@@ -837,6 +1000,19 @@ class Neighbor2InverseSlice(pl.LightningModule):
             batch_size=1,
         )
 
+        if self.regularizer:
+            mean_nei = torch.stack(losses_nei).mean()
+            mean_reg = torch.stack(losses_reg).mean()
+            print(
+                f"Cone U-Net training for {scan_id}: L_Nei={float(mean_nei):.6f} "
+                f"L_reg={float(mean_reg):.6f} weight={reg_weight:.4f}"
+            )
+            # Upstream names: train_loss1 = L_Nei, train_loss2 = weight * L_reg.
+            self.log("train_loss1", mean_nei, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train_loss2", reg_weight * mean_reg, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("train_loss_reg_raw", mean_reg, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("reg_weight", float(reg_weight), on_epoch=True, sync_dist=True, batch_size=1)
+
         return mean_loss
 
     def validation_step_cone(self, batch, batch_idx):
@@ -853,14 +1029,29 @@ class Neighbor2InverseSlice(pl.LightningModule):
         val_generator = torch.Generator(device="cpu")
         val_generator.manual_seed(self.val_mask_seed + batch_idx)
 
+        tag = f"e{self.current_epoch} {scan_id} val"
         with h5py.File(path_proj, "r") as f:
-            reco_sub1, reco_sub2 = self.make_cone_pair(
-                f["images"], detector_offset_m, source_offset_m, generator=val_generator,
-                tag=f"e{self.current_epoch} {scan_id} val",
-            )
+            if self.regularizer:
+                reco_sub1, reco_sub2, masks = self.make_cone_pair(
+                    f["images"], detector_offset_m, source_offset_m, generator=val_generator,
+                    tag=tag, return_masks=True,
+                )
+            else:
+                reco_sub1, reco_sub2 = self.make_cone_pair(
+                    f["images"], detector_offset_m, source_offset_m, generator=val_generator,
+                    tag=tag,
+                )
 
         # Same 192 central slices as training.
         slice_indices = self.cone_slice_indices(reco_sub1.shape[0])
+
+        if self.regularizer:
+            # Same mask as the validation pair, current weights for f(y).
+            fullres_volume = self.load_fullres_cone(path_reco_fullres)
+            exp_diff = self.cone_reg_correction(
+                fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag
+            )[slice_indices]
+            del fullres_volume, masks
 
         reco_sub1 = self.normalize_cone(reco_sub1[slice_indices], scan_id)
         reco_sub2 = self.normalize_cone(reco_sub2[slice_indices], scan_id)
@@ -873,6 +1064,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         # Mini-batched forward passes; accumulate an element-weighted mean so the
         # result equals the MSE over all slices regardless of the batch split.
         sq_err_sum = 0.0
+        reg_err_sum = 0.0
         n_elements = 0
 
         for start in range(0, reco_sub1.shape[0], self.val_batch_size):
@@ -882,12 +1074,29 @@ class Neighbor2InverseSlice(pl.LightningModule):
             noisy_inpt, pad = pad_to_divisible(batch_sub1, 32)
             noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
 
-            sq_err_sum += float(((noisy_output.float() - batch_sub2.float()) ** 2).sum())
+            diff = noisy_output.float() - batch_sub2.float()
+            sq_err_sum += float((diff ** 2).sum())
+            if self.regularizer:
+                batch_exp_diff = exp_diff[start:start + self.val_batch_size].unsqueeze(1)
+                reg_err_sum += float(((diff - batch_exp_diff) ** 2).sum())
             n_elements += batch_sub2.numel()
+            del diff
 
-        loss = torch.tensor(sq_err_sum / n_elements, device=self.device)
-
-        print(f"Cone validation loss for {scan_id}: {float(loss):.6f}")
+        if self.regularizer:
+            # Upstream validation: weight fixed at 1, val_loss = Lambda1*L_Nei + Lambda2*L_reg.
+            loss_nei = sq_err_sum / n_elements
+            loss_reg = reg_err_sum / n_elements
+            loss = torch.tensor(self.Lambda1 * loss_nei + self.Lambda2 * loss_reg, device=self.device)
+            del exp_diff
+            print(
+                f"Cone validation loss for {scan_id}: {float(loss):.6f} "
+                f"(L_Nei={loss_nei:.6f}, L_reg={loss_reg:.6f})"
+            )
+            self.log("val_loss1", loss_nei, on_epoch=True, sync_dist=True, batch_size=1)
+            self.log("val_loss2", loss_reg, on_epoch=True, sync_dist=True, batch_size=1)
+        else:
+            loss = torch.tensor(sq_err_sum / n_elements, device=self.device)
+            print(f"Cone validation loss for {scan_id}: {float(loss):.6f}")
 
         self.log(
             "val_loss",

@@ -23,16 +23,14 @@ torch.set_float32_matmul_precision('medium')
 def check_cone_config(trainparams):
     """
     The cone-beam path currently implements only projection subsampling
-    with the Neighbor loss (L_Nei, MSE). Fail loudly on anything else
-    instead of silently ignoring it.
+    with the Neighbor loss (L_Nei, MSE), optionally with L_reg (regularizer: True).
+    Fail loudly on anything else instead of silently ignoring it.
     """
     lp = trainparams['lightning_params']
     unsupported = []
 
     if lp.get('subsampling', 'projection') != 'projection':
         unsupported.append(f"subsampling='{lp['subsampling']}' (only 'projection')")
-    if lp.get('regularizer', True):  # model default is True, so require an explicit False
-        unsupported.append("regularizer=True (L_reg)")
     if lp.get('dataFidelity', False):
         unsupported.append("dataFidelity=True")
     if lp.get('loss_type', 'mse') != 'mse':
@@ -126,7 +124,13 @@ def main(trainparams):
     lr_monitor = pl.pytorch.callbacks.LearningRateMonitor(logging_interval='epoch') 
     tblogger = pl.pytorch.loggers.TensorBoardLogger(save_path) 
     csvlogger = pl.pytorch.loggers.CSVLogger(save_path, version=tblogger.version) 
-    checkpoint = pl.pytorch.callbacks.ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=3, filename='{epoch}_valL{val_loss:.4f}', save_last=True)
+    if is_cone and trainparams['lightning_params'].get('regularizer', True):
+        # Cone + L_reg: val_loss is the total (L_Nei + L_reg); also show val_loss1 (= L_Nei),
+        # e.g. "epoch=49-val_loss=0.04213-val_loss1=0.02120.ckpt".
+        ckpt_filename = '{epoch}-{val_loss:.5f}-{val_loss1:.5f}'
+    else:
+        ckpt_filename = '{epoch}_valL{val_loss:.4f}'
+    checkpoint = pl.pytorch.callbacks.ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=3, filename=ckpt_filename, save_last=True)
 
     if trainparams["earlyStopping"] == True:
         early_stopping = EarlyStopping(**trainparams["earlyStopping_params"]) #stops trainig process if performance does not improve anymore

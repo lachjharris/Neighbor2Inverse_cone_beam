@@ -1,8 +1,8 @@
-# Neighbor2Inverse, cone-beam: projection subsampling, L_Nei (MSE) only.
-# Unsupported options (sinogram subsampling, L_reg, data fidelity, sparse
-# sampling) raise NotImplementedError in 1_trainNeighbor2Inverse.py.
+# Neighbor2Inverse, cone-beam: projection subsampling, L_Nei + L_reg (MSE).
+# Unsupported options (sinogram subsampling, data fidelity, sparse sampling)
+# raise NotImplementedError in 1_trainNeighbor2Inverse.py.
 
-name: 'N2I_cone_projSub_LNei' # subfolder name under save_path
+name: 'N2I_cone_projSub_LNei_Lreg' # subfolder name under save_path; for L_Nei only use 'N2I_cone_projSub_LNei'
 base_network:
   type: UNet
   params:
@@ -37,12 +37,12 @@ val_loader:
 lightning_params:
     coneBeam: True
     subsampling: 'projection'
-    regularizer: False   # must be explicit: model default is True
+    regularizer: True    # L_reg on. Set False for L_Nei only, and change name back to 'N2I_cone_projSub_LNei'
     dataFidelity: False
     loss_type: 'mse'
     doPhaseRetrieval: True
     df_stats_path: './cone_stats.csv' # per-scan stats from 0_calculateStatsCone.py
-    n_epoch: 13
+    n_epoch: 50           # run length (max_epochs) AND length of the L_reg weight ramp
     lr: 0.0005
     val_mask_seed: 0      # validation uses a fixed Neighbor mask (seed + val scan index) every epoch
     val_batch_size: 8     # validation slices per forward pass (all 192 central slices are evaluated)
@@ -52,7 +52,9 @@ lightning_params:
     # 554, 556, 564: into the spike; 576: last spike update; 577, 578: recovery (e12 Mouse_5).
     snapshot_steps: [] #[552, 553, 554, 556, 564, 576, 577, 578]
 
-    # Required by the Neighbor2InverseSlice signature; only used by L_reg, so unused here.
+    # L_reg (upstream): loss = Lambda1*L_Nei + Lambda2*w*L_reg, w = epoch / n_epoch * increase_ratio
+    # (0 at epoch 0, 1.96 at epoch 49 for n_epoch 50). Validation uses w = 1, so
+    # val_loss = Lambda1*L_Nei + Lambda2*L_reg; val_loss1 (= L_Nei) is comparable with L_Nei-only runs.
     Lambda1: 1.0
     Lambda2: 1.0
     increase_ratio: 2.0
