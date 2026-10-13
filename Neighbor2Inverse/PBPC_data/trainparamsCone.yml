@@ -66,7 +66,8 @@ lightning_params:
       batchsizePR: 32
 
     coneBeam_params:
-      total_rotation_deg: -360.272
+      total_rotation_deg: -360.094  # first-to-last frame arc: 2023 steps x 0.178 deg (2024 frames;
+                                    # acquisition had 2025, first dropped). Must match CONE_N_PROJECTIONS.
       source_origin_m: 0.5
       origin_det_m: 1.0
       true_pixel_size_m: 0.000110  # detector pixel of the subsampled projections (2 x 55 um native)

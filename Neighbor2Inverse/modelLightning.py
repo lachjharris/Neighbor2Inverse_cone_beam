@@ -474,7 +474,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
     # Cone-beam helpers (shared by training, validation and the LR range test)
     # ------------------------------------------------------------------
     # Fixed acquisition constants for the current cone-beam data.
-    CONE_N_PROJECTIONS = 2023  # projections per scan used for FDK
+    CONE_N_PROJECTIONS = 2024  # projections per scan (all frames; must match total_rotation_deg
+                               # in coneBeam_params: 2023 steps x 0.178 deg = 360.094 deg)
     CONE_DETECTOR_ROWS = 512   # detector rows used (full WidePIX MPX3 height)
     CONE_CHUNK_ANGLES = 32     # projections Neighbor-subsampled per chunk
     CONE_SLICE_MARGIN = 32     # half-res slices excluded at each end of the volume
@@ -553,10 +554,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
         detector_rows = self.CONE_DETECTOR_ROWS
         chunk_angles = self.CONE_CHUNK_ANGLES
 
-        if data.shape[0] < n_projections or data.shape[1] < detector_rows:
+        # Exact frame count: the angles come from linspace(0, total_rotation_deg, n), so a
+        # different count would silently change the angular step.
+        if data.shape[0] != n_projections or data.shape[1] < detector_rows:
             raise ValueError(
-                f"Projection data shape {data.shape} is smaller than the expected "
-                f"({n_projections} angles, {detector_rows} rows)"
+                f"Projection data shape {data.shape} does not match the expected "
+                f"{n_projections} angles and at least {detector_rows} rows"
             )
         if generator is not None and generator.device.type != "cpu":
             raise ValueError("make_cone_pair expects a CPU generator (masks are built on CPU)")
