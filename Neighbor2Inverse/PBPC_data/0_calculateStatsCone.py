@@ -37,10 +37,14 @@ import h5py
 import torch
 import yaml
 
-from modelLightning import compute_paganin_batch
+from modelLightning import compute_paganin_batch, Neighbor2InverseSlice
 from astra_cone_array import astra_cone_from_array
 
 NEIGHBOR_FACTOR = 2  # Neighbor subsampling halves rows and columns
+# Same frames and detector rows as training (make_cone_pair), so the full-res volumes
+# share the training geometry: 2024 frames, rows [:512] (the 513th row is dropped).
+N_PROJECTIONS = Neighbor2InverseSlice.CONE_N_PROJECTIONS
+DETECTOR_ROWS = Neighbor2InverseSlice.CONE_DETECTOR_ROWS
 
 
 def paganin_constants(PR_params):
@@ -56,16 +60,23 @@ def phase_retrieve_fullres(path_proj, mu, sigma, pixel_size_mm, batchsizePR, chu
     Paganin-retrieve every full-resolution projection, chunked over angles.
     Phase retrieval acts on each projection independently, so chunking gives
     the same result as processing the whole stack at once.
+    Uses detector rows [:DETECTOR_ROWS] only, cropped before Paganin as in training.
     Returns projected thickness in metres, shape [angle, row, col].
     """
     with h5py.File(path_proj, "r") as f:
         data = f["images"]
-        n_angles, n_rows, n_cols = data.shape
+        n_angles, n_rows_file, n_cols = data.shape
+        if n_angles != N_PROJECTIONS or n_rows_file < DETECTOR_ROWS:
+            raise ValueError(
+                f"{path_proj}: projection data shape {data.shape} does not match the expected "
+                f"{N_PROJECTIONS} angles and at least {DETECTOR_ROWS} rows"
+            )
+        n_rows = DETECTOR_ROWS
         thickness_m = np.empty((n_angles, n_rows, n_cols), dtype=np.float32)
 
         for start in range(0, n_angles, chunk_angles):
             stop = min(start + chunk_angles, n_angles)
-            proj = torch.from_numpy(data[start:stop].astype(np.float32)).to(device)
+            proj = torch.from_numpy(data[start:stop, :n_rows].astype(np.float32)).to(device)
             with torch.no_grad():
                 phase_mm = compute_paganin_batch(
                     proj, mu=mu, sigma=sigma,
