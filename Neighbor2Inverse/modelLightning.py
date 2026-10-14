@@ -318,11 +318,15 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 val_batch_size = 8,
                 snapshot_steps = None,
                 snapshot_dir = None,
+                cone_reg_mode = "upstream",
 
                 ):
         
         super().__init__()
         self.network = network
+        if cone_reg_mode not in ("upstream", "mirrored"):
+            raise ValueError(f"cone_reg_mode must be 'upstream' or 'mirrored', got {cone_reg_mode!r}")
+        self.cone_reg_mode = cone_reg_mode  # cone L_reg correction, see cone_reg_correction
         self.Lambda1 = Lambda1
         self.Lambda2 = Lambda2
         self.increase_ratio = increase_ratio
@@ -351,6 +355,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             self.factor = 2
         self.doPhaseRetrieval = doPhaseRetrieval
         if self.doPhaseRetrieval:
+            self.PR_params = dict(PR_params)  # cone L_reg (mirrored) needs delta, energy, z for TIE
             self.batchsizePR = PR_params['batchsizePR']
             self.beta = PR_params['beta']
             self.pixel_size = PR_params['pixel_size']
@@ -490,6 +495,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
     CONE_DETECTOR_ROWS = 512   # detector rows used (full WidePIX MPX3 height)
     CONE_CHUNK_ANGLES = 32     # projections Neighbor-subsampled per chunk
     CONE_SLICE_MARGIN = 32     # half-res slices excluded at each end of the volume
+    # L_reg (mirrored): the forward projection of the finite reconstructed volume misses material
+    # above/below it in the outermost detector rows (cone-beam truncation; ~6 rows here), so the
+    # thickness steps down there and the TIE's second derivative spikes. Those rows are replaced
+    # by the nearest unaffected row before propagation. They only feed end slices outside
+    # CONE_SLICE_MARGIN.
+    CONE_TIE_EDGE_ROWS = 8
     CONE_NUM_REALIZATIONS = 4  # fresh Neighbor masks per training scan
     CONE_MINI_BATCH_SIZE = 8   # training slices per optimizer step
 
@@ -677,14 +688,44 @@ class Neighbor2InverseSlice(pl.LightningModule):
         del x, x_pad, y
         return denoised
 
+    def _tie_intensity_cone(self, thickness_m):
+        """
+        Projected thickness [angles, rows, cols] (metres, numpy, full-res pixels) -> intensity by
+        TIE forward propagation (inverse of Paganin; single material, SI units), float32 numpy.
+        The outer CONE_TIE_EDGE_ROWS rows are first replaced by the nearest inner row (see there).
+        """
+        PR = self.PR_params
+        k = self.CONE_TIE_EDGE_ROWS
+        t = torch.from_numpy(thickness_m).to(self.device, dtype=torch.float32)
+        t = t.clone()
+        t[:, :k] = t[:, k:k + 1]
+        t[:, -k:] = t[:, -k - 1:-k]
+        t = t[:, None]
+        with torch.autocast(self.device.type, enabled=False):  # the Laplacian is a conv2d: keep float32
+            intensity = propTIE_torch(
+                delta=t * PR["delta"], beta=t * PR["beta"], energy=PR["energy"],
+                distance=PR["z"] * 1e-3,                            # mm -> m
+                px=PR["pixel_size"] * 1e-3 / self.factor,           # full-res object-plane pixel, m
+                batch_size=t.shape[0], supersample=1, mode="TIE", use_float64=False,
+            )[:, 0]
+        out = intensity.float().cpu().numpy()
+        del t, intensity
+        return out
+
     def cone_reg_correction(self, volume, scan_id, masks, detector_offset_m, source_offset_m, tag=""):
         """
         Correction term of L_reg for one Neighbor realization (no gradients):
             exp_diff = normalize(R g1(R^-1 f(y))) - normalize(R g2(R^-1 f(y)))
         f(y): full-res volume denoised with the current weights; R^-1: cone forward projection
         (full-res geometry); g1/g2: this realization's masks; R: FDK in the training geometry.
-        No Paganin: the denoised volume is a thickness reconstruction, so its forward
-        projection is already projected thickness (as upstream).
+
+        cone_reg_mode "upstream" (Neighbor2Inverse Eq. 7): subsample the forward-projected
+        thickness directly, no Paganin.
+        cone_reg_mode "mirrored": same operator order as the training pair R T g(p):
+            exp_diff = normalize(R T g1(T^-1 R^-1 f(y))) - normalize(R T g2(T^-1 R^-1 f(y)))
+        with T^-1 = TIE forward propagation (thickness -> intensity) and T = Paganin at half
+        resolution, exactly as make_cone_pair. Subsampling and Paganin do not commute when
+        neighbouring pixels differ (small detector PSF), so "upstream" mis-states the gap.
 
         Returns:
             exp_diff [half-res slices, y, x] float32 on self.device, in normalized units
@@ -719,16 +760,30 @@ class Neighbor2InverseSlice(pl.LightningModule):
         del denoised
 
         # g1, g2: the realization's masks, applied to every angle as in make_cone_pair
+        # ("mirrored": to the TIE-propagated intensities, then Paganin at half resolution)
+        mirrored = self.cone_reg_mode == "mirrored"
         f1 = np.empty((n_projections, detector_rows // 2, n_cols // 2), dtype=np.float32)
         f2 = np.empty_like(f1)
+        i_min, i_max, n_unphys = np.inf, -np.inf, 0
         for start in range(0, n_projections, self.CONE_CHUNK_ANGLES):
             stop = min(start + self.CONE_CHUNK_ANGLES, n_projections)
-            chunk = torch.from_numpy(forward[start:stop]).unsqueeze(0)
+            block = forward[start:stop]
+            if mirrored:
+                block = self._tie_intensity_cone(block)
+                i_min, i_max = min(i_min, float(block.min())), max(i_max, float(block.max()))
+                n_unphys += int(((block < 0) | (block > 1.5)).sum())
+            chunk = torch.from_numpy(block).unsqueeze(0)
             f1[start:stop] = generate_subimages(chunk, mask1)[0].numpy()
             f2[start:stop] = generate_subimages(chunk, mask2)[0].numpy()
-        del forward, chunk
+        del forward, chunk, block
 
-        # R: FDK in the training geometry (as the training pairs, without Paganin)
+        if mirrored:
+            print(f"  diag {tag} reg     TIE intensity: min={i_min:.4f} max={i_max:.4f} "
+                  f"unphysical (<0 or >1.5) fraction={n_unphys / (n_projections * detector_rows * n_cols):.2e}")
+            f1 = self._paganin_thickness_m(f1)
+            f2 = self._paganin_thickness_m(f2)
+
+        # R: FDK in the training geometry
         c1 = self.reconstruct_cone(torch.from_numpy(f1), detector_offset_m=detector_offset_m,
                                    source_offset_m=source_offset_m).to(self.device)
         del f1

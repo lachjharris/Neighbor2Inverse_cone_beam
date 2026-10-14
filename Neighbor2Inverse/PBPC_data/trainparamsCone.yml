@@ -38,6 +38,11 @@ lightning_params:
     coneBeam: True
     subsampling: 'projection'
     regularizer: True    # L_reg on. Set False for L_Nei only, and change name back to 'N2I_cone_projSub_LNei'
+    # L_reg correction: 'mirrored' builds it with the training pair's operator order
+    # (forward projection -> TIE (inverse Paganin) -> subsample -> Paganin -> FDK);
+    # 'upstream' subsamples the forward-projected thickness directly (Neighbor2Inverse Eq. 7).
+    # Upstream's shortcut assumes neighbouring pixels barely differ (large PSF); see visualize_cone_correction.py.
+    cone_reg_mode: 'mirrored'
     dataFidelity: False
     loss_type: 'mse'
     doPhaseRetrieval: True
