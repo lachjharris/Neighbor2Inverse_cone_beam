@@ -45,7 +45,16 @@ def check_cone_config(trainparams):
 
 
 def main(trainparams):
-    pl.seed_everything(42)
+    # Optional top-level 'seed' in the YAML (default 42 = all earlier runs). It sets Lightning's
+    # global seed (initial weights, data order, slice shuffling) AND offsets the counter that seeds
+    # the training Neighbor masks (modelLightning.get_generator), which otherwise restarts at 0 in
+    # every run. Seed 42 keeps offset 0, i.e. exactly the masks of all earlier runs. Validation
+    # masks have their own fixed seed (val_mask_seed) and are unaffected.
+    import modelLightning
+    seed = int(trainparams.get('seed', 42))
+    pl.seed_everything(seed)
+    modelLightning.operation_seed_counter = 0 if seed == 42 else (seed + 1) * 1_000_000
+    print(f"seed {seed}, Neighbor mask counter offset {modelLightning.operation_seed_counter}")
     is_cone = trainparams['lightning_params'].get('coneBeam', False)
     if is_cone:
         check_cone_config(trainparams)
