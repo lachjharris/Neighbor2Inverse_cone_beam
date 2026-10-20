@@ -319,6 +319,9 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 snapshot_steps = None,
                 snapshot_dir = None,
                 cone_reg_mode = "upstream",
+                cone_num_realizations = 4,
+                cone_slices_per_realization = "split",
+                cone_mix_realizations = False,
 
                 ):
         
@@ -327,6 +330,22 @@ class Neighbor2InverseSlice(pl.LightningModule):
         if cone_reg_mode not in ("upstream", "mirrored"):
             raise ValueError(f"cone_reg_mode must be 'upstream' or 'mirrored', got {cone_reg_mode!r}")
         self.cone_reg_mode = cone_reg_mode  # cone L_reg correction, see cone_reg_correction
+        # Cone training schedule per scan (defaults = the original behaviour):
+        #   cone_num_realizations        fresh Neighbor masks per training scan
+        #   cone_slices_per_realization  "split": the central slices are divided between the realizations
+        #                                "all":   every realization trains on all central slices
+        #   cone_mix_realizations        False: train each realization's slices right after building it
+        #                                True:  build all realizations first, then draw every mini-batch
+        #                                       at random across realizations (consecutive updates, and
+        #                                       slices within a batch, use different masks); with L_reg,
+        #                                       all corrections then use the weights from the scan's start
+        if cone_slices_per_realization not in ("split", "all"):
+            raise ValueError(f"cone_slices_per_realization must be 'split' or 'all', got {cone_slices_per_realization!r}")
+        if int(cone_num_realizations) < 1:
+            raise ValueError(f"cone_num_realizations must be >= 1, got {cone_num_realizations!r}")
+        self.cone_num_realizations = int(cone_num_realizations)
+        self.cone_slices_per_realization = cone_slices_per_realization
+        self.cone_mix_realizations = bool(cone_mix_realizations)
         self.Lambda1 = Lambda1
         self.Lambda2 = Lambda2
         self.increase_ratio = increase_ratio
@@ -526,13 +545,13 @@ class Neighbor2InverseSlice(pl.LightningModule):
     def cone_training_slice_groups(self):
         """
         Shuffle the central half-res slices once and split them into
-        CONE_NUM_REALIZATIONS non-overlapping groups (one group per Neighbor realization).
+        cone_num_realizations non-overlapping groups (one group per Neighbor realization).
         """
         valid_indices = self.cone_slice_indices(self.CONE_DETECTOR_ROWS // 2)
         shuffled_indices = valid_indices[
             torch.randperm(valid_indices.numel(), device=self.device)
         ]
-        return torch.chunk(shuffled_indices, self.CONE_NUM_REALIZATIONS)
+        return torch.chunk(shuffled_indices, self.cone_num_realizations)
 
     def _paganin_thickness_m(self, proj):
         """
@@ -880,6 +899,87 @@ class Neighbor2InverseSlice(pl.LightningModule):
             return torch.autocast("cpu", dtype=torch.get_autocast_cpu_dtype(), cache_enabled=False)
         return contextlib.nullcontext()
 
+    def _cone_train_update(self, optimizer, batch_sub1, batch_sub2, batch_exp, reg_weight,
+                           scan_id, realization_idx, batch_number, slice_indices,
+                           losses, losses_nei, losses_reg):
+        """
+        One cone optimizer update on normalised [B, 1, H, W] batches (batch_exp: L_reg correction or
+        None), with the per-update diagnostics. realization_idx 0 = mixed batch (several masks).
+        """
+        noisy_inpt, pad = pad_to_divisible(batch_sub1, 32)
+
+        optimizer.zero_grad()
+
+        # Fresh autocast context per update, so the forward uses the current weights.
+        with self._step_autocast():
+            noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
+            if self.regularizer:
+                # Upstream: loss = Lambda1*L_Nei + Lambda2*w*L_reg; exp_diff carries no gradient.
+                diff = noisy_output.float() - batch_sub2.float()
+                loss_nei = torch.mean(diff ** 2)
+                loss_reg = torch.mean((diff - batch_exp) ** 2)
+                loss = self.Lambda1 * loss_nei + self.Lambda2 * reg_weight * loss_reg
+                del diff
+            else:
+                loss = self.loss(noisy_output, batch_sub2)
+            self.manual_backward(loss)
+        grad_norm = self._grad_norm()  # before the step, i.e. the gradient this update uses
+
+        # Output decomposition for this batch (same output the loss used):
+        # loss = err_mean**2 + err_std**2; res = what the network changed.
+        with torch.no_grad():
+            out_f = noisy_output.detach().float()
+            err = out_f - batch_sub2.float()
+            res = out_f - batch_sub1.float()
+            err_mean, err_std = float(err.mean()), float(err.std(correction=0))
+            res_mean, res_std = float(res.mean()), float(res.std(correction=0))
+            del out_f, err, res
+        out_bias = self._output_bias()  # before the update
+
+        # global_step counts completed updates, so this is update number global_step + 1.
+        if (self.global_step + 1) in self.snapshot_steps:
+            self._save_snapshot(
+                update_step=self.global_step + 1,
+                optimizer=optimizer,
+                batch_sub1=batch_sub1,
+                batch_sub2=batch_sub2,
+                info={
+                    "epoch": self.current_epoch,
+                    "scan_id": scan_id,
+                    "realization": realization_idx,
+                    "batch": batch_number,
+                    "slice_indices": slice_indices.detach().cpu(),
+                    "loss": float(loss.detach()),
+                },
+            )
+
+        params_before = self._flat_params()
+        optimizer.step()
+        with torch.no_grad():
+            dtheta = float(torch.linalg.vector_norm(self._flat_params() - params_before))
+        del params_before
+
+        losses.append(loss.detach())
+        reg_msg = ""
+        if self.regularizer:
+            losses_nei.append(loss_nei.detach())
+            losses_reg.append(loss_reg.detach())
+            reg_msg = f" nei={loss_nei.item():.6f} reg={loss_reg.item():.6f} w={reg_weight:.4f}"
+            del loss_nei, loss_reg
+
+        # Per-update diagnostics (grep "update e<epoch> <scan>" in the .out file).
+        loss_value = loss.item()
+        flag = "" if np.isfinite(loss_value) and np.isfinite(grad_norm) else "  NON-FINITE"
+        print(
+            f"  update e{self.current_epoch} {scan_id} "
+            f"r{realization_idx} b{batch_number}: "
+            f"step={self.global_step} loss={loss_value:.6f}{reg_msg} "
+            f"grad_norm={grad_norm:.4e} "
+            f"err_mean={err_mean:+.4f} err_std={err_std:.4f} "
+            f"res_mean={res_mean:+.4f} res_std={res_std:.4f} "
+            f"bias={out_bias:+.5f} dtheta={dtheta:.3e}{flag}"
+        )
+
     def training_step_cone(self, batch, batch_idx):
         path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = self._unpack_cone_batch(batch)
 
@@ -889,20 +989,31 @@ class Neighbor2InverseSlice(pl.LightningModule):
             f"source={source_offset_m} m"
         )
 
-        num_realizations = self.CONE_NUM_REALIZATIONS
+        num_realizations = self.cone_num_realizations
         mini_batch_size = self.CONE_MINI_BATCH_SIZE
+        use_all = self.cone_slices_per_realization == "all"
+        mix = self.cone_mix_realizations
 
-        # 192 central half-res slices, shuffled into four non-overlapping groups of 48.
-        slice_groups = self.cone_training_slice_groups()
+        if use_all:
+            # Every realization trains on all central slices, each in its own random order.
+            central = self.cone_slice_indices(self.CONE_DETECTOR_ROWS // 2)
+            slice_groups = [central[torch.randperm(central.numel(), device=self.device)]
+                            for _ in range(num_realizations)]
+        else:
+            # Default: 192 central half-res slices, shuffled into non-overlapping groups (4 x 48).
+            slice_groups = self.cone_training_slice_groups()
 
         print(
             f"Cone training for {scan_id}: "
             f"{sum(g.numel() for g in slice_groups)} slices across "
             f"{num_realizations} Neighbor realizations"
+            + (f" (slices per realization: {self.cone_slices_per_realization}, mixed batches)" if mix
+               else (f" (slices per realization: all)" if use_all else ""))
         )
 
         optimizer = self.optimizers()
         losses = []
+        losses_nei, losses_reg, reg_weight = None, None, None
 
         # L_reg (upstream schedule; computed from epoch 0 even though its weight is 0 there).
         if self.regularizer:
@@ -910,6 +1021,10 @@ class Neighbor2InverseSlice(pl.LightningModule):
             losses_nei, losses_reg = [], []
             fullres_volume = self.load_fullres_cone(path_reco_fullres)  # f(y) input, reused by all realizations
             print(f"Cone L_reg for {scan_id}: weight={reg_weight:.4f}, full-res input {fullres_volume.shape}")
+
+        if mix:
+            margin = self.CONE_SLICE_MARGIN
+            store = []  # per realization: normalised central g1, g2 (and exp_diff), on self.device
 
         with h5py.File(path_proj, "r") as f:
             data = f["images"]
@@ -927,8 +1042,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     reco_sub1, reco_sub2, masks = self.make_cone_pair(
                         data, detector_offset_m, source_offset_m, tag=tag, return_masks=True
                     )
-                    # Correction term with the weights at the start of this realization,
-                    # reused (as a constant) by its updates.
+                    # Correction term with the weights at the start of this realization
+                    # (mixed batches: of the scan), reused (as a constant) by its updates.
                     exp_diff = self.cone_reg_correction(
                         fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag
                     )
@@ -939,7 +1054,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     )
 
                 # Network-independent check of this realization's training pairs:
-                # identity_mse is the loss an identity network would get on these 48 slices.
+                # identity_mse is the loss an identity network would get on its slices.
                 with torch.no_grad():
                     pair1 = self.normalize_cone(reco_sub1[slice_group], scan_id).float()
                     pair2 = self.normalize_cone(reco_sub2[slice_group], scan_id).float()
@@ -949,92 +1064,61 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     print(f"  diag {tag} pair identity_mse={identity_mse:.6f}")
                     del pair1, pair2
 
-                # Train only on this realization's 48 assigned slices.
-                for start in range(0, slice_group.numel(), mini_batch_size):
-                    slice_indices = slice_group[start:start + mini_batch_size]
-
-                    batch_sub1 = self.normalize_cone(reco_sub1[slice_indices], scan_id).unsqueeze(1)
-                    batch_sub2 = self.normalize_cone(reco_sub2[slice_indices], scan_id).unsqueeze(1)
-
-                    noisy_inpt, pad = pad_to_divisible(batch_sub1, 32)
-
-                    optimizer.zero_grad()
-
-                    # Fresh autocast context per update, so the forward uses the current weights.
-                    with self._step_autocast():
-                        noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
-                        if self.regularizer:
-                            # Upstream: loss = Lambda1*L_Nei + Lambda2*w*L_reg; exp_diff carries no gradient.
-                            diff = noisy_output.float() - batch_sub2.float()
-                            loss_nei = torch.mean(diff ** 2)
-                            loss_reg = torch.mean((diff - exp_diff[slice_indices].unsqueeze(1)) ** 2)
-                            loss = self.Lambda1 * loss_nei + self.Lambda2 * reg_weight * loss_reg
-                            del diff
-                        else:
-                            loss = self.loss(noisy_output, batch_sub2)
-                        self.manual_backward(loss)
-                    grad_norm = self._grad_norm()  # before the step, i.e. the gradient this update uses
-
-                    # Output decomposition for this batch (same output the loss used):
-                    # loss = err_mean**2 + err_std**2; res = what the network changed.
-                    with torch.no_grad():
-                        out_f = noisy_output.detach().float()
-                        err = out_f - batch_sub2.float()
-                        res = out_f - batch_sub1.float()
-                        err_mean, err_std = float(err.mean()), float(err.std(correction=0))
-                        res_mean, res_std = float(res.mean()), float(res.std(correction=0))
-                        del out_f, err, res
-                    out_bias = self._output_bias()  # before the update
-
-                    # global_step counts completed updates, so this is update number global_step + 1.
-                    if (self.global_step + 1) in self.snapshot_steps:
-                        self._save_snapshot(
-                            update_step=self.global_step + 1,
-                            optimizer=optimizer,
-                            batch_sub1=batch_sub1,
-                            batch_sub2=batch_sub2,
-                            info={
-                                "epoch": self.current_epoch,
-                                "scan_id": scan_id,
-                                "realization": realization_idx,
-                                "batch": start // mini_batch_size + 1,
-                                "slice_indices": slice_indices.detach().cpu(),
-                                "loss": float(loss.detach()),
-                            },
-                        )
-
-                    params_before = self._flat_params()
-                    optimizer.step()
-                    with torch.no_grad():
-                        dtheta = float(torch.linalg.vector_norm(self._flat_params() - params_before))
-                    del params_before
-
-                    losses.append(loss.detach())
-                    reg_msg = ""
+                if mix:
+                    # Keep only what the mixed updates need: normalised central slices (index = slice - margin).
+                    central = self.cone_slice_indices(reco_sub1.shape[0])
+                    entry = {
+                        "g1": self.normalize_cone(reco_sub1[central], scan_id),
+                        "g2": self.normalize_cone(reco_sub2[central], scan_id),
+                        "slices": slice_group,
+                    }
                     if self.regularizer:
-                        losses_nei.append(loss_nei.detach())
-                        losses_reg.append(loss_reg.detach())
-                        reg_msg = f" nei={loss_nei.item():.6f} reg={loss_reg.item():.6f} w={reg_weight:.4f}"
-                        del loss_nei, loss_reg
+                        entry["exp"] = exp_diff[central]
+                    store.append(entry)
+                else:
+                    # Train only on this realization's assigned slices.
+                    for start in range(0, slice_group.numel(), mini_batch_size):
+                        slice_indices = slice_group[start:start + mini_batch_size]
 
-                    # Per-update diagnostics (grep "update e<epoch> <scan>" in the .out file).
-                    loss_value = loss.item()
-                    flag = "" if np.isfinite(loss_value) and np.isfinite(grad_norm) else "  NON-FINITE"
-                    print(
-                        f"  update e{self.current_epoch} {scan_id} "
-                        f"r{realization_idx} b{start // mini_batch_size + 1}: "
-                        f"step={self.global_step} loss={loss_value:.6f}{reg_msg} "
-                        f"grad_norm={grad_norm:.4e} "
-                        f"err_mean={err_mean:+.4f} err_std={err_std:.4f} "
-                        f"res_mean={res_mean:+.4f} res_std={res_std:.4f} "
-                        f"bias={out_bias:+.5f} dtheta={dtheta:.3e}{flag}"
-                    )
+                        batch_sub1 = self.normalize_cone(reco_sub1[slice_indices], scan_id).unsqueeze(1)
+                        batch_sub2 = self.normalize_cone(reco_sub2[slice_indices], scan_id).unsqueeze(1)
+                        batch_exp = exp_diff[slice_indices].unsqueeze(1) if self.regularizer else None
+
+                        self._cone_train_update(
+                            optimizer, batch_sub1, batch_sub2, batch_exp, reg_weight,
+                            scan_id, realization_idx, start // mini_batch_size + 1, slice_indices,
+                            losses, losses_nei, losses_reg,
+                        )
 
                 # We no longer need this realization's volumes.
                 del reco_sub1, reco_sub2
                 if self.regularizer:
                     del exp_diff
                 torch.cuda.empty_cache()
+
+        if mix:
+            # Every (realization, slice) sample once, in one random order: mini-batches mix masks.
+            sample_r = torch.cat([torch.full((e["slices"].numel(),), r, dtype=torch.long, device=self.device)
+                                  for r, e in enumerate(store)])
+            sample_s = torch.cat([e["slices"] for e in store])
+            order = torch.randperm(sample_r.numel(), device=self.device)
+            sample_r, sample_s = sample_r[order], sample_s[order]
+            print(f"Cone mixed training for {scan_id}: {sample_r.numel()} samples from {len(store)} realizations")
+            for start in range(0, sample_r.numel(), mini_batch_size):
+                rs = sample_r[start:start + mini_batch_size].tolist()
+                ss = sample_s[start:start + mini_batch_size]
+                pos = (ss - margin).tolist()
+                batch_sub1 = torch.stack([store[r]["g1"][p] for r, p in zip(rs, pos)]).unsqueeze(1)
+                batch_sub2 = torch.stack([store[r]["g2"][p] for r, p in zip(rs, pos)]).unsqueeze(1)
+                batch_exp = (torch.stack([store[r]["exp"][p] for r, p in zip(rs, pos)]).unsqueeze(1)
+                             if self.regularizer else None)
+                self._cone_train_update(
+                    optimizer, batch_sub1, batch_sub2, batch_exp, reg_weight,
+                    scan_id, 0, start // mini_batch_size + 1, ss,
+                    losses, losses_nei, losses_reg,
+                )
+            del store, sample_r, sample_s, order
+            torch.cuda.empty_cache()
 
         if self.regularizer:
             del fullres_volume
