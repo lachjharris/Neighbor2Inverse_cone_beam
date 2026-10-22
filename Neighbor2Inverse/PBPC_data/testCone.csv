@@ -1,0 +1,2 @@
+path_proj,scan_id,detector_offset_m,source_offset_m,path_reco_fullres
+/fs04/yd88/Lachie/data/n2i/Mouse_4_CT_W_NoFilter_50kVp_50W_SID1500mm_SOD500mm_exp150ms_CSM_THL0_5p9_THL1_10p1_dtheta0p178_rotspeed1p18dps/Projections_FAD.h5,Mouse_4,0.000495,1.65e-05,/fs04/scratch2/yd88/Lachie/Neighbor2Inverse/code/Neighbor2Inverse/PBPC_data/full_recons/Mouse_4_reco_fullres.npy

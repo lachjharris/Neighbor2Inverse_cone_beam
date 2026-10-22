@@ -1,0 +1,10 @@
+# Local data, outputs and job logs (not part of the code)
+Neighbor2Inverse/PBPC_data/full_recons/
+Neighbor2Inverse/PBPC_data/model_weights/
+Neighbor2Inverse/PBPC_data/geometry_check/
+Neighbor2Inverse/PBPC_data/inference_*/
+Neighbor2Inverse/PBPC_data/correction_check/
+Neighbor2Inverse/PBPC_data/cone_stats.csv
+Neighbor2Inverse/slurm/
+__pycache__/
+*.patch
