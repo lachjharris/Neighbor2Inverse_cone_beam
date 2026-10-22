@@ -24,37 +24,37 @@ def get_generator(device="cuda"):
     g_cuda_generator.manual_seed(operation_seed_counter)
     return g_cuda_generator
 
-def space_to_depth(x, block_size):
+def space_to_depth(x, block_size): # helper for generate_subimages
     n, c, h, w = x.size()
-    unfolded_x = torch.nn.functional.unfold(x, block_size, stride=block_size)
-    return unfolded_x.view(n, c * block_size**2, h // block_size,
+    unfolded_x = torch.nn.functional.unfold(x, block_size, stride=block_size) # chop image into 2x2 cells
+    return unfolded_x.view(n, c * block_size**2, h // block_size,               # basically reshape
                            w // block_size)
 
-def generate_subimages(img, mask):
-    n, c, h, w = img.shape
-    subimage = torch.zeros(n,
+def generate_subimages(img, mask): # generate_mask_pair builds two big True/False masks that say which pixel to keep from each 2x2 cell
+    n, c, h, w = img.shape         # this function then pulls out those pixels (take masks output of generate_mask_pair as input)
+    subimage = torch.zeros(n,      # prepare half res output image (full of zeros)
                            c,
                            h // 2,
                            w // 2,
                            dtype=img.dtype,
                            layout=img.layout,
                            device=img.device)
-    # per channel
+    # per channel (angle) note this could be confusing because we are used to seeing channels = 1 because greyscale (no RGB) but here channels are angles.
     for i in range(c):
         img_per_channel = space_to_depth(img[:, i:i + 1, :, :], block_size=2)
         img_per_channel = img_per_channel.permute(0, 2, 3, 1).reshape(-1)
-        subimage[:, i:i + 1, :, :] = img_per_channel[mask].reshape(
+        subimage[:, i:i + 1, :, :] = img_per_channel[mask].reshape( # apply the mask
             n, h // 2, w // 2, 1).permute(0, 3, 1, 2)
     return subimage
 
 
 def generate_mask_pair(img, generator=None):
-    # prepare masks (N x C x H/2 x W/2)
+    # prepare masks (N x C x H/2 x W/2) (boolean masks used by generate_subimages above)
     # generator: optional torch.Generator (same device as img) for reproducible masks;
     # default None keeps the original behaviour (global seed counter).
-    if generator is None:
-        generator = get_generator(device=img.device)
-    n, c, h, w = img.shape
+    if generator is None:                               # random number generator. This is seeded for validation so that the mask for validation is always the same. 
+        generator = get_generator(device=img.device)    # It is not seeded for training
+    n, c, h, w = img.shape                              # unpack the projection images so the dimensions can be used as variables 
     device = img.device
     mask1 = torch.zeros(size=(n * h // 2 * w // 2 * 4, ),
                         dtype=torch.bool,
@@ -64,26 +64,26 @@ def generate_mask_pair(img, generator=None):
                         device=img.device)
     # prepare random mask pairs
     idx_pair = torch.tensor(
-        [[0, 1], [0, 2], [1, 3], [2, 3], [1, 0], [2, 0], [3, 1], [3, 2]],
-        dtype=torch.int64,
+        [[0, 1], [0, 2], [1, 3], [2, 3], [1, 0], [2, 0], [3, 1], [3, 2]], # the 8 allowed combinations of neighbouring pixels for a given 2x2 square labelled as:  0 1
+        dtype=torch.int64,                                                                                                                                       # 2 3 
         device=img.device)
     rd_idx = torch.zeros(size=(n * h // 2 * w // 2, ),
                          dtype=torch.int64, device=img.device)
     
-    torch.randint(low=0,
+    torch.randint(low=0,                            # Generate a random number between 0 and 7 (corresponding to one of the eight possible pairings) for each 2x2 cell in the projection 
                   high=8,
-                  size=(n * h // 2 * w // 2, ),
+                  size=(n * h // 2 * w // 2, ),     # size is how many random numbers to generate, corresponding to the number of 2x2 cells in a projection (n=1 in make_cone_pair)
                   generator=generator,
                   out=rd_idx)
-    rd_pair_idx = idx_pair[rd_idx]
-    rd_pair_idx += torch.arange(start=0,
+    rd_pair_idx = idx_pair[rd_idx]                  # extract the pair corresponding to the random number generated 
+    rd_pair_idx += torch.arange(start=0,                            # this confuses me a bit 
                                 end=n * h // 2 * w // 2 * 4,
                                 step=4,
                                 device=img.device).reshape(-1, 1)
     # get masks
     mask1[rd_pair_idx[:, 0]] = 1
     mask2[rd_pair_idx[:, 1]] = 1
-    return mask1, mask2
+    return mask1, mask2 # output is fed into generate_subimages
 
 class Neighbor2NeighborModule(pl.LightningModule):
     def __init__(self, 
@@ -414,6 +414,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         """
         Per-scan normalization, cone-beam counterpart of normalize():
         whole-volume mean/std of the scan's full-resolution reconstruction.
+        Subtract mean and divide by standard deviation
         """
         row = self.df_stats[self.df_stats["scan_id"].astype(str) == str(scan_id)]
         if len(row) != 1:
@@ -496,7 +497,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             **cone_params,
         )
 
-        reconstruction = torch.from_numpy(
+        reconstruction = torch.from_numpy(      # convert the reconstructed numpy array into torch tensor 
             reconstruction_np
         ).to(
             device=device,
@@ -576,6 +577,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
     def make_cone_pair(self, data, detector_offset_m, source_offset_m, generator=None, tag="", return_masks=False):
         """
+        turns one scan’s raw projections into the two training volumes: g1 and g2, subsampled, phase-retrieved and reconstructed. 
+        It runs once per realisation (4 times per training scan) and once per validation scan
         One Neighbor realization for cone-beam Neighbor2Inverse:
         projections -> Neighbor subsampling (one mask, shared by all angles)
         -> Paganin -> cone-beam FDK.
@@ -608,29 +611,29 @@ class Neighbor2InverseSlice(pl.LightningModule):
         if generator is not None and generator.device.type != "cpu":
             raise ValueError("make_cone_pair expects a CPU generator (masks are built on CPU)")
 
-        # Neighbor mask from one projection; reused for every angle.
+        # Generate neighbor mask from one projection; reused for every angle.
         dummy = torch.from_numpy(data[0:1, :detector_rows, :]).unsqueeze(0)
-        mask1, mask2 = generate_mask_pair(dummy, generator=generator)
+        mask1, mask2 = generate_mask_pair(dummy, generator=generator) 
 
-        g1 = np.empty(
-            (n_projections, detector_rows // 2, data.shape[2] // 2),
+        g1 = np.empty(      # Reserve space for g1 and g2 (apparently faster than zeros)
+            (n_projections, detector_rows // 2, data.shape[2] // 2), 
             dtype=np.float32,
         )
         g2 = np.empty_like(g1)
 
-        for start in range(0, n_projections, chunk_angles):
+        for start in range(0, n_projections, chunk_angles): # subsample projections in chunks to save memory
             stop = min(start + chunk_angles, n_projections)
             projections = torch.from_numpy(
                 data[start:stop, :detector_rows, :]
             ).unsqueeze(0)
-            g1[start:stop] = generate_subimages(projections, mask1)[0].numpy()
+            g1[start:stop] = generate_subimages(projections, mask1)[0].numpy() # apply the masks 
             g2[start:stop] = generate_subimages(projections, mask2)[0].numpy()
 
         print(f"Cone Neighbor pair: g1={g1.shape}, g2={g2.shape}")
         print(f"  diag {tag} proj    g1: {summary_stats(g1)}")
         print(f"  diag {tag} proj    g2: {summary_stats(g2)}")
 
-        # Paganin for both halves first (moved to CPU), then FDK, to limit peak GPU memory.
+        # Paganin phase (thickness) retrieval for both halves first (moved to CPU), then FDK, to limit peak GPU memory.
         g1_phase_m = self._paganin_thickness_m(g1)
         del g1
         g2_phase_m = self._paganin_thickness_m(g2)
@@ -641,8 +644,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
         print(f"  diag {tag} paganin g2: {summary_stats(g2_phase_m)}")
 
         # Cone-beam FDK. Rebinding each name drops the numpy array as it moves to the GPU.
-        g1_phase_m = torch.from_numpy(g1_phase_m).to(self.device)
-        reco_sub1 = self.reconstruct_cone(
+        g1_phase_m = torch.from_numpy(g1_phase_m).to(self.device) # move data to GPU
+        reco_sub1 = self.reconstruct_cone( 
             g1_phase_m,
             detector_offset_m=detector_offset_m,
             source_offset_m=source_offset_m,
@@ -1049,7 +1052,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     )
                     del masks
                 else:
-                    reco_sub1, reco_sub2 = self.make_cone_pair(
+                    reco_sub1, reco_sub2 = self.make_cone_pair(             # make the two reconstructed half-res volumes
                         data, detector_offset_m, source_offset_m, tag=tag
                     )
 
@@ -1080,8 +1083,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
                     for start in range(0, slice_group.numel(), mini_batch_size):
                         slice_indices = slice_group[start:start + mini_batch_size]
 
-                        batch_sub1 = self.normalize_cone(reco_sub1[slice_indices], scan_id).unsqueeze(1)
-                        batch_sub2 = self.normalize_cone(reco_sub2[slice_indices], scan_id).unsqueeze(1)
+                        batch_sub1 = self.normalize_cone(reco_sub1[slice_indices], scan_id).unsqueeze(1) # pytorch expects [batch size, channels (1), height, width]
+                        batch_sub2 = self.normalize_cone(reco_sub2[slice_indices], scan_id).unsqueeze(1) # these lines add the channel dimension and apply normalisation
                         batch_exp = exp_diff[slice_indices].unsqueeze(1) if self.regularizer else None
 
                         self._cone_train_update(
