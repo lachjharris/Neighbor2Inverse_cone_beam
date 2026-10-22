@@ -105,12 +105,15 @@ def compare(ref, test, z_range, disk):
 
 def main():
     with open(args.trainparams, "r") as f:
-        cone_params = dict(yaml.safe_load(f)["lightning_params"]["coneBeam_params"])
+        lp = yaml.safe_load(f)["lightning_params"]
+    cone_params = dict(lp["coneBeam_params"])
+    n_expected = int(lp.get("cone_n_projections") or N_PROJECTIONS)
 
     row = pd.read_csv(args.csv).set_index("scan_id").loc[args.scan_id]
     offsets = dict(
         horizontal_detector_offset_m=float(row["detector_offset_m"]),
         horizontal_source_offset_m=float(row["source_offset_m"]),
+        horizontal_sample_offset_m=float(row.get("sample_offset_m", 0.0)),
     )
     stats = pd.read_csv(args.stats_path).set_index("scan_id").loc[args.scan_id]
     scan_std = float(stats["std"])
@@ -118,9 +121,9 @@ def main():
     with h5py.File(row["path_proj"], "r") as f:
         h5_shape = f["images"].shape
     print(f"{args.scan_id}: projections in HDF5 {h5_shape}")
-    if h5_shape[0] != N_PROJECTIONS or h5_shape[1] < DETECTOR_ROWS:
-        raise ValueError(f"expected {N_PROJECTIONS} frames and at least {DETECTOR_ROWS} rows")
-    n_angles = N_PROJECTIONS
+    if h5_shape[0] != n_expected or h5_shape[1] < DETECTOR_ROWS:
+        raise ValueError(f"expected {n_expected} frames and at least {DETECTOR_ROWS} rows")
+    n_angles = n_expected
 
     # Full-res geometry, as in 0_calculateStatsCone.py
     full_params = dict(cone_params)

@@ -181,7 +181,7 @@ def main():
 
     while not stop:
         for batch in loader:
-            path_proj, scan_id, det_off, src_off, _ = model._unpack_cone_batch(batch)
+            path_proj, scan_id, det_off, src_off, _, smp_off = model._unpack_cone_batch(batch)
 
             with autocast_context(precision, device):
                 slice_groups = model.cone_training_slice_groups()
@@ -191,7 +191,7 @@ def main():
 
                     for realization_idx, slice_group in enumerate(slice_groups, start=1):
                         print(f"[{k}/{n}] {scan_id}: realization {realization_idx}/{len(slice_groups)}")
-                        reco_sub1, reco_sub2 = model.make_cone_pair(data, det_off, src_off)
+                        reco_sub1, reco_sub2 = model.make_cone_pair(data, det_off, src_off, sample_offset_m=smp_off)
 
                         for start in range(0, slice_group.numel(), model.CONE_MINI_BATCH_SIZE):
                             idx = slice_group[start:start + model.CONE_MINI_BATCH_SIZE]

@@ -85,6 +85,7 @@ def main():
     row = pd.read_csv(tp["dataset_val"]["df_path"]).iloc[args.val_index]
     scan_id = str(row["scan_id"])
     det, src = float(row["detector_offset_m"]), float(row["source_offset_m"])
+    smp = float(row.get("sample_offset_m", 0.0))
     mean, std = model.cone_scan_stats(scan_id)
 
     captured = {}
@@ -101,11 +102,14 @@ def main():
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         with h5py.File(row["path_proj"], "r") as f:
             reco1, reco2, masks = model.make_cone_pair(
-                f["images"], det, src, generator=gen, tag=f"{scan_id} viz", return_masks=True)
+                f["images"], det, src, generator=gen, tag=f"{scan_id} viz", return_masks=True,
+                sample_offset_m=smp)
         model.cone_reg_mode = "upstream"
-        exp_diff = model.cone_reg_correction(volume, scan_id, masks, det, src, tag=f"{scan_id} upstream")
+        exp_diff = model.cone_reg_correction(volume, scan_id, masks, det, src, tag=f"{scan_id} upstream",
+                                             sample_offset_m=smp)
         model.cone_reg_mode = "mirrored"
-        exp_diff_m = model.cone_reg_correction(volume, scan_id, masks, det, src, tag=f"{scan_id} mirrored")
+        exp_diff_m = model.cone_reg_correction(volume, scan_id, masks, det, src, tag=f"{scan_id} mirrored",
+                                               sample_offset_m=smp)
 
         idx = model.cone_slice_indices(reco1.shape[0])
         g1 = model.normalize_cone(reco1[idx], scan_id)

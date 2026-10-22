@@ -322,6 +322,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 cone_num_realizations = 4,
                 cone_slices_per_realization = "split",
                 cone_mix_realizations = False,
+                cone_n_projections = None,
 
                 ):
         
@@ -346,6 +347,10 @@ class Neighbor2InverseSlice(pl.LightningModule):
         self.cone_num_realizations = int(cone_num_realizations)
         self.cone_slices_per_realization = cone_slices_per_realization
         self.cone_mix_realizations = bool(cone_mix_realizations)
+        # Frames per scan (exact); must match coneBeam_params.total_rotation_deg (first-to-last arc).
+        # None -> CONE_N_PROJECTIONS (2024, the original dataset).
+        self.cone_n_projections = (int(cone_n_projections) if cone_n_projections is not None
+                                   else self.CONE_N_PROJECTIONS)
         self.Lambda1 = Lambda1
         self.Lambda2 = Lambda2
         self.increase_ratio = increase_ratio
@@ -441,9 +446,11 @@ class Neighbor2InverseSlice(pl.LightningModule):
         projections,
         detector_offset_m=None,
         source_offset_m=None,
+        sample_offset_m=None,
     ):
         """
-        Cone-beam FDK reconstruction using ASTRA.
+        Cone-beam FDK reconstruction using ASTRA. sample_offset_m: horizontal sample
+        (rotation-axis) offset; passed to ASTRA only when nonzero.
 
         Args:
             projections:
@@ -492,6 +499,11 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 source_offset_m
             )
 
+        if sample_offset_m:
+            cone_params["horizontal_sample_offset_m"] = float(
+                sample_offset_m
+            )
+
         reconstruction_np = astra_cone_from_array(
             projections_np,
             **cone_params,
@@ -526,13 +538,14 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
     def _unpack_cone_batch(self, batch):
         """Unwrap a cone DataLoader batch (batch size 1)."""
-        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = batch
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres, sample_offset_m = batch
         return (
             path_proj[0],
             scan_id[0],
             detector_offset_m[0].item(),
             source_offset_m[0].item(),
             path_reco_fullres[0],
+            sample_offset_m[0].item(),
         )
 
     def cone_slice_indices(self, n_slices):
@@ -575,7 +588,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
         torch.cuda.empty_cache()
         return thickness_m
 
-    def make_cone_pair(self, data, detector_offset_m, source_offset_m, generator=None, tag="", return_masks=False):
+    def make_cone_pair(self, data, detector_offset_m, source_offset_m, generator=None, tag="", return_masks=False,
+                       sample_offset_m=0.0):
         """
         turns one scan’s raw projections into the two training volumes: g1 and g2, subsampled, phase-retrieved and reconstructed. 
         It runs once per realisation (4 times per training scan) and once per validation scan
@@ -585,7 +599,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         Args:
             data: open h5py dataset of flat-field-corrected projections [angle, row, col].
-            detector_offset_m, source_offset_m: per-scan geometry offsets.
+            detector_offset_m, source_offset_m, sample_offset_m: per-scan geometry offsets.
             generator: optional CPU torch.Generator. None draws a fresh mask from the
                 global seed counter (training); a seeded generator gives a reproducible
                 mask (validation).
@@ -597,7 +611,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             (reco_sub1, reco_sub2): un-normalized half-resolution volumes on self.device,
             or (reco_sub1, reco_sub2, (mask1, mask2)) if return_masks.
         """
-        n_projections = self.CONE_N_PROJECTIONS
+        n_projections = self.cone_n_projections
         detector_rows = self.CONE_DETECTOR_ROWS
         chunk_angles = self.CONE_CHUNK_ANGLES
 
@@ -649,6 +663,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             g1_phase_m,
             detector_offset_m=detector_offset_m,
             source_offset_m=source_offset_m,
+            sample_offset_m=sample_offset_m,
         )
         del g1_phase_m
         torch.cuda.empty_cache()
@@ -658,6 +673,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             g2_phase_m,
             detector_offset_m=detector_offset_m,
             source_offset_m=source_offset_m,
+            sample_offset_m=sample_offset_m,
         )
         del g2_phase_m
         torch.cuda.empty_cache()
@@ -734,7 +750,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
         del t, intensity
         return out
 
-    def cone_reg_correction(self, volume, scan_id, masks, detector_offset_m, source_offset_m, tag=""):
+    def cone_reg_correction(self, volume, scan_id, masks, detector_offset_m, source_offset_m, tag="",
+                            sample_offset_m=0.0):
         """
         Correction term of L_reg for one Neighbor realization (no gradients):
             exp_diff = normalize(R g1(R^-1 f(y))) - normalize(R g2(R^-1 f(y)))
@@ -755,7 +772,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         """
         mask1, mask2 = masks
         mean, std = self.cone_scan_stats(scan_id)
-        n_projections = self.CONE_N_PROJECTIONS
+        n_projections = self.cone_n_projections
         detector_rows = self.CONE_DETECTOR_ROWS
         n_cols = volume.shape[2]
 
@@ -778,6 +795,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
             rotation_offset_deg=cp.get("rotation_offset_deg"),
             horizontal_detector_offset_m=float(detector_offset_m),
             horizontal_source_offset_m=float(source_offset_m),
+            horizontal_sample_offset_m=float(sample_offset_m),
         )
         del denoised
 
@@ -807,10 +825,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
 
         # R: FDK in the training geometry
         c1 = self.reconstruct_cone(torch.from_numpy(f1), detector_offset_m=detector_offset_m,
-                                   source_offset_m=source_offset_m).to(self.device)
+                                   source_offset_m=source_offset_m,
+                                   sample_offset_m=sample_offset_m).to(self.device)
         del f1
         c2 = self.reconstruct_cone(torch.from_numpy(f2), detector_offset_m=detector_offset_m,
-                                   source_offset_m=source_offset_m).to(self.device)
+                                   source_offset_m=source_offset_m,
+                                   sample_offset_m=sample_offset_m).to(self.device)
         del f2
 
         exp_diff = (c1 - c2) / std
@@ -984,12 +1004,14 @@ class Neighbor2InverseSlice(pl.LightningModule):
         )
 
     def training_step_cone(self, batch, batch_idx):
-        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = self._unpack_cone_batch(batch)
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres, sample_offset_m = \
+            self._unpack_cone_batch(batch)
 
         print(
             f"Cone geometry for {scan_id}: "
             f"detector={detector_offset_m} m, "
             f"source={source_offset_m} m"
+            + (f", sample={sample_offset_m} m" if sample_offset_m else "")
         )
 
         num_realizations = self.cone_num_realizations
@@ -1043,17 +1065,20 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 tag = f"e{self.current_epoch} {scan_id} r{realization_idx}"
                 if self.regularizer:
                     reco_sub1, reco_sub2, masks = self.make_cone_pair(
-                        data, detector_offset_m, source_offset_m, tag=tag, return_masks=True
+                        data, detector_offset_m, source_offset_m, tag=tag, return_masks=True,
+                        sample_offset_m=sample_offset_m,
                     )
                     # Correction term with the weights at the start of this realization
                     # (mixed batches: of the scan), reused (as a constant) by its updates.
                     exp_diff = self.cone_reg_correction(
-                        fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag
+                        fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag,
+                        sample_offset_m=sample_offset_m,
                     )
                     del masks
                 else:
                     reco_sub1, reco_sub2 = self.make_cone_pair(             # make the two reconstructed half-res volumes
-                        data, detector_offset_m, source_offset_m, tag=tag
+                        data, detector_offset_m, source_offset_m, tag=tag,
+                        sample_offset_m=sample_offset_m,
                     )
 
                 # Network-independent check of this realization's training pairs:
@@ -1158,12 +1183,14 @@ class Neighbor2InverseSlice(pl.LightningModule):
         return mean_loss
 
     def validation_step_cone(self, batch, batch_idx):
-        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres = self._unpack_cone_batch(batch)
+        path_proj, scan_id, detector_offset_m, source_offset_m, path_reco_fullres, sample_offset_m = \
+            self._unpack_cone_batch(batch)
 
         print(
             f"Cone geometry for {scan_id}: "
             f"detector={detector_offset_m} m, "
             f"source={source_offset_m} m"
+            + (f", sample={sample_offset_m} m" if sample_offset_m else "")
         )
 
         # Fixed seed per validation scan: the same mask every epoch, so changes
@@ -1176,12 +1203,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
             if self.regularizer:
                 reco_sub1, reco_sub2, masks = self.make_cone_pair(
                     f["images"], detector_offset_m, source_offset_m, generator=val_generator,
-                    tag=tag, return_masks=True,
+                    tag=tag, return_masks=True, sample_offset_m=sample_offset_m,
                 )
             else:
                 reco_sub1, reco_sub2 = self.make_cone_pair(
                     f["images"], detector_offset_m, source_offset_m, generator=val_generator,
-                    tag=tag,
+                    tag=tag, sample_offset_m=sample_offset_m,
                 )
 
         # Same 192 central slices as training.
@@ -1191,7 +1218,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
             # Same mask as the validation pair, current weights for f(y).
             fullres_volume = self.load_fullres_cone(path_reco_fullres)
             exp_diff = self.cone_reg_correction(
-                fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag
+                fullres_volume, scan_id, masks, detector_offset_m, source_offset_m, tag=tag,
+                sample_offset_m=sample_offset_m,
             )[slice_indices]
             del fullres_volume, masks
 

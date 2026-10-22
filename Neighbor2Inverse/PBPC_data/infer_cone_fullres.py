@@ -80,7 +80,7 @@ def halfres_volume(model, row, out_dir, chunk=64):
     if os.path.exists(path):
         print(f"loading cached {path}")
         return np.load(path)
-    n, rows = model.CONE_N_PROJECTIONS, model.CONE_DETECTOR_ROWS
+    n, rows = model.cone_n_projections, model.CONE_DETECTOR_ROWS
     with h5py.File(row["path_proj"], "r") as f:
         data = f["images"]
         if data.shape[0] != n or data.shape[1] < rows:
@@ -96,7 +96,8 @@ def halfres_volume(model, row, out_dir, chunk=64):
     del binned
     vol = model.reconstruct_cone(torch.from_numpy(thickness),
                                  detector_offset_m=float(row["detector_offset_m"]),
-                                 source_offset_m=float(row["source_offset_m"])).cpu().numpy().astype(np.float32)
+                                 source_offset_m=float(row["source_offset_m"]),
+                                 sample_offset_m=float(row.get("sample_offset_m", 0.0))).cpu().numpy().astype(np.float32)
     del thickness
     np.save(path, vol)
     print(f"half-res reconstruction {vol.shape} saved to {path}")
@@ -114,6 +115,7 @@ def subsample_volume(model, row, out_dir, seed):
     with torch.no_grad(), h5py.File(row["path_proj"], "r") as f:
         reco1, reco2 = model.make_cone_pair(f["images"], float(row["detector_offset_m"]),
                                             float(row["source_offset_m"]), generator=gen,
+                                            sample_offset_m=float(row.get("sample_offset_m", 0.0)),
                                             tag=f"{row['scan_id']} sub")
     vol = reco1.float().cpu().numpy()
     del reco1, reco2

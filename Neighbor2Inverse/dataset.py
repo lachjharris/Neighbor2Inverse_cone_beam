@@ -267,12 +267,19 @@ class ConeBeamProjDataset(torch.utils.data.Dataset):
 
         path_reco_fullres = str(row["path_reco_fullres"])
 
+        # Optional horizontal sample (rotation-axis) offset; 0 when the CSV has no such column.
+        if "sample_offset_m" in self.df.columns:
+            sample_offset_m = float(row["sample_offset_m"])
+        else:
+            sample_offset_m = 0.0
+
         return (
             path_proj,
             scan_id,
             detector_offset_m,
             source_offset_m,
             path_reco_fullres,
+            sample_offset_m,
         )
 
 class ClinicalDataset(torch.utils.data.Dataset):

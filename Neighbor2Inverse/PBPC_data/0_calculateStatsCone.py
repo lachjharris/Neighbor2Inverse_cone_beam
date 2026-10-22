@@ -42,7 +42,9 @@ from astra_cone_array import astra_cone_from_array
 
 NEIGHBOR_FACTOR = 2  # Neighbor subsampling halves rows and columns
 # Same frames and detector rows as training (make_cone_pair), so the full-res volumes
-# share the training geometry: 2024 frames, rows [:512] (the 513th row is dropped).
+# share the training geometry: rows [:512] (the 513th row is dropped) and exactly the
+# configured number of frames (lightning_params.cone_n_projections, default
+# CONE_N_PROJECTIONS = 2024; set in main() from the YAML).
 N_PROJECTIONS = Neighbor2InverseSlice.CONE_N_PROJECTIONS
 DETECTOR_ROWS = Neighbor2InverseSlice.CONE_DETECTOR_ROWS
 
@@ -107,6 +109,11 @@ def main():
     with open(args.trainparams, "r") as f:
         lp = yaml.safe_load(f)["lightning_params"]
 
+    global N_PROJECTIONS
+    if lp.get("cone_n_projections") is not None:
+        N_PROJECTIONS = int(lp["cone_n_projections"])
+    print(f"frames per scan: {N_PROJECTIONS}, total_rotation_deg: {lp['coneBeam_params']['total_rotation_deg']}")
+
     PR_params = lp["PR_params"]
     mu, sigma = paganin_constants(PR_params)
     pixel_size_full_mm = PR_params["pixel_size"] / NEIGHBOR_FACTOR
@@ -139,6 +146,7 @@ def main():
             **cone_params,
             horizontal_detector_offset_m=float(row["detector_offset_m"]),
             horizontal_source_offset_m=float(row["source_offset_m"]),
+            horizontal_sample_offset_m=float(row.get("sample_offset_m", 0.0)),
         )
         del thickness_m
         print("reconstructed:", reco.shape)
