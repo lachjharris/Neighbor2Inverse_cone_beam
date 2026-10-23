@@ -141,6 +141,19 @@ def main(trainparams):
         ckpt_filename = '{epoch}_valL{val_loss:.4f}'
     checkpoint = pl.pytorch.callbacks.ModelCheckpoint(monitor="val_loss", mode="min", save_top_k=3, filename=ckpt_filename, save_last=True)
 
+    # Optional top-level 'checkpoint_every_n_epochs: N' in the YAML: also keep every N-th epoch
+    # regardless of val_loss (val L_Nei cannot see full-res denoising strength, so checkpoints are
+    # selected afterwards on the validation mouse). Files are prefixed 'periodic_' and land in the
+    # same checkpoints/ folder; N = 5 keeps epochs 4, 9, ..., 49. Absent or null: no change.
+    checkpoint_every_n = trainparams.get('checkpoint_every_n_epochs')
+    periodic_checkpoint = None
+    if checkpoint_every_n:
+        periodic_checkpoint = pl.pytorch.callbacks.ModelCheckpoint(
+            monitor=None, save_top_k=-1, every_n_epochs=int(checkpoint_every_n),
+            filename='periodic_' + ckpt_filename, save_last=False,
+        )
+        print(f"periodic checkpoints every {int(checkpoint_every_n)} epochs")
+
     if trainparams["earlyStopping"] == True:
         early_stopping = EarlyStopping(**trainparams["earlyStopping_params"]) #stops trainig process if performance does not improve anymore
     else:
@@ -167,7 +180,7 @@ def main(trainparams):
     
     # -----  init trainer and start training -----
     trainer = pl.Trainer(logger=[csvlogger, tblogger], 
-                        callbacks=[cb for cb in [lr_monitor, checkpoint, savetrainparams_callback, prediction_callback, early_stopping] if cb is not None],
+                        callbacks=[cb for cb in [lr_monitor, checkpoint, periodic_checkpoint, savetrainparams_callback, prediction_callback, early_stopping] if cb is not None],
                         max_epochs=trainparams['lightning_params']['n_epoch'],
                         accelerator='gpu',
                         devices=trainparams['gpus'], 

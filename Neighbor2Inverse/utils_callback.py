@@ -181,6 +181,65 @@ class SavePredictionCallback(Callback):
         # Switch back to training mode
         pl_module.train()
 
+def save_cone_progress_panels(path_png, path_tif, inpt, pred, fov, residual_range, title,
+                              scan_mean, scan_std, show_residual=True, save_tiff=True):
+    """
+    Draw [input, prediction, (residual)] for SavePredictionCallbackCone (numpy only, no torch).
+    All arrays are 2-D float, physical units (same units as the full-res reconstruction).
+
+    PNG: input and prediction share the input's window (FOV mean +- 3 std, as before); the residual
+    (input - prediction) uses the FIXED symmetric window +- residual_range, so its brightness is
+    comparable between epochs and runs. Each panel has a colourbar; the residual title gives its
+    std (also as a fraction of the scan std used for normalisation) and the fraction of FOV pixels
+    clipped by the window.
+    TIFF (save_tiff): float32 ImageJ stack of the same panels, unscaled, for Fiji.
+    Returns a dict of the residual numbers (None if show_residual is False).
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import tifffile
+
+    vals = inpt[fov]
+    vmin, vmax = float(vals.mean() - 3 * vals.std()), float(vals.mean() + 3 * vals.std())
+    panels = [(inpt, "input", vmin, vmax), (pred, "prediction", vmin, vmax)]
+    stats = None
+    if show_residual:
+        res = inpt - pred
+        r = float(residual_range)
+        res_fov = res[fov]
+        stats = {
+            "std": float(res_fov.std()),
+            "mean": float(res_fov.mean()),
+            "std_over_scan_std": float(res_fov.std() / scan_std),
+            "clipped_fraction": float((np.abs(res_fov) > r).mean()),
+        }
+        panels.append((res, (f"residual (input - prediction)\n"
+                             f"std {stats['std']:.4g} = {stats['std_over_scan_std']:.4f} scan std, "
+                             f"mean {stats['mean']:.3g}\n"
+                             f"fixed window +-{r:.4g}, clipped {100 * stats['clipped_fraction']:.2f}% of FOV"),
+                       -r, r))
+
+    fig = Figure(figsize=(7.2 * len(panels), 7.8), dpi=100)
+    FigureCanvasAgg(fig)
+    axes = fig.subplots(1, len(panels))
+    for ax, (img, label, lo, hi) in zip(axes, panels):
+        im = ax.imshow(img, cmap="gray", vmin=lo, vmax=hi, interpolation="nearest")
+        ax.set_title(label, fontsize=11)
+        ax.set_axis_off()
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+        cbar.set_label("reconstruction units")
+    fig.suptitle(f"{title}   (input/prediction window {vmin:.4g} .. {vmax:.4g}; "
+                 f"scan mean {scan_mean:.4g}, std {scan_std:.4g})", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(path_png)
+
+    if save_tiff:
+        labels = ["input", "prediction"] + (["residual (input - prediction)"] if show_residual else [])
+        tifffile.imwrite(path_tif, np.stack([p[0] for p in panels]).astype(np.float32),
+                         imagej=True, metadata={"Labels": labels})
+    return stats
+
+
 class SavePredictionCallbackCone(Callback):
     """
     Cone-beam counterpart of SavePredictionCallback: at train start and after every
@@ -190,8 +249,18 @@ class SavePredictionCallbackCone(Callback):
     There is no high-dose reference for the cone data, so the residual
     (input - prediction) takes the place of upstream's reference panel: it should
     look like structureless noise; visible anatomy means structure is being removed.
+
+    Outputs per call (physical units, see save_cone_progress_panels):
+      <name>_<epoch>_<scan>_slice<k>_progress.png  panels with colourbars; the residual has a FIXED
+                                                   window, so its brightness compares across epochs/runs
+      <name>_<epoch>_<scan>_slice<k>_progress.tif  float32 stack for Fiji (save_tiff: True)
+    residual_range: half-width of the residual window (reconstruction units). null -> 3 x a rough
+    noise estimate of the input slice (horizontal neighbour differences in the FOV), fixed on the
+    first call. It depends only on the input slice, so runs on the same slice get the same window.
+    The residual numbers are also printed to the .out ("prediction callback ...").
     """
-    def __init__(self, output_dir, volume_path, scan_id, slice_idx=None, show_residual=True):
+    def __init__(self, output_dir, volume_path, scan_id, slice_idx=None, show_residual=True,
+                 residual_range=None, save_tiff=True):
         super().__init__()
         if not os.path.exists(volume_path):
             raise FileNotFoundError(f"Full-res reconstruction not found: {volume_path}")
@@ -210,7 +279,26 @@ class SavePredictionCallbackCone(Callback):
         self.scan_id = scan_id
         self.slice_idx = slice_idx
         self.show_residual = show_residual
+        self.save_tiff = save_tiff
+        if residual_range is None:
+            self.residual_range = 3 * self.noise_estimate(self.slice, self.fov)
+            source = "3 x neighbour-difference noise estimate of the input slice"
+        else:
+            self.residual_range = float(residual_range)
+            source = "from the YAML"
+        print(f"prediction callback: residual window +-{self.residual_range:.5g} ({source})")
         os.makedirs(output_dir, exist_ok=True)
+
+    @staticmethod
+    def noise_estimate(img, fov):
+        """
+        Rough noise std of img from horizontal neighbour differences inside the FOV: std(d) / sqrt(2).
+        Neighbouring voxels of an FDK reconstruction are correlated and edges add to d, so this is
+        not an exact noise level; it only fixes a display range that is the same for every epoch.
+        """
+        both = fov[:, 1:] & fov[:, :-1]
+        d = (img[:, 1:] - img[:, :-1])[both]
+        return float(d.std() / np.sqrt(2))
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.is_global_zero:
@@ -219,12 +307,6 @@ class SavePredictionCallbackCone(Callback):
     def on_train_start(self, trainer, pl_module):
         if trainer.is_global_zero:
             self.save_current_progress(trainer, pl_module, "start")
-
-    @staticmethod
-    def _window(img, fov, n_std=3):
-        vals = img[fov]
-        mn, std = vals.mean(), vals.std()
-        return normalize_to_range(img, vmin=mn - n_std * std, vmax=mn + n_std * std)
 
     def save_current_progress(self, trainer, pl_module, name):
         from modelLightning import pad_to_divisible, unpad_from_divisible
@@ -239,21 +321,22 @@ class SavePredictionCallbackCone(Callback):
             inpt_pad, pad = pad_to_divisible(input_image, 32)
             predicted_image = unpad_from_divisible(pl_module(inpt_pad), pad)
 
-        inpt = input_image[0].float().cpu()      # [1, H, W]
-        pred = predicted_image[0].float().cpu()
-        fov = torch.from_numpy(self.fov)[None]
+        # Back to physical units (the scan stats used by normalize_cone).
+        mean, std = pl_module.cone_scan_stats(self.scan_id)
+        pred = predicted_image[0, 0].float().cpu().numpy() * std + mean
+        del input_image, inpt_pad, predicted_image
 
-        # Input and prediction share one window (from the input), as upstream.
-        vals = inpt[fov]
-        vmin, vmax = vals.mean() - 3 * vals.std(), vals.mean() + 3 * vals.std()
-        img_list = [normalize_to_range(img, vmin=vmin, vmax=vmax) for img in (inpt, pred)]
-        if self.show_residual:
-            img_list.append(self._window(inpt - pred, fov))
-
-        save_image(img_list, os.path.join(
-            self.output_dir,
-            f"{name}_{trainer.current_epoch}_{self.scan_id}_slice{self.slice_idx}_progress.png",
-        ))
+        stem = os.path.join(self.output_dir,
+                            f"{name}_{trainer.current_epoch}_{self.scan_id}_slice{self.slice_idx}_progress")
+        stats = save_cone_progress_panels(
+            stem + ".png", stem + ".tif", self.slice, pred, self.fov, self.residual_range,
+            title=f"{name} {trainer.current_epoch}: {self.scan_id} slice {self.slice_idx}",
+            scan_mean=mean, scan_std=std, show_residual=self.show_residual, save_tiff=self.save_tiff,
+        )
+        if stats is not None:
+            print(f"prediction callback {name} {trainer.current_epoch}: residual std {stats['std']:.5g} "
+                  f"({stats['std_over_scan_std']:.4f} scan std), mean {stats['mean']:.4g}, "
+                  f"clipped {100 * stats['clipped_fraction']:.2f}% of FOV")
 
         if was_training:
             pl_module.train()
