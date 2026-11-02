@@ -13,6 +13,13 @@ Outputs in --out_dir:
   <label>_denoised.npy          denoised volume per checkpoint (unless --no_volumes)
   z<k>_compare.tif              per preview slice: input, each output, each residual (input - output),
                                 ImageJ slice labels; float32, physical units (as the reconstructions)
+  compare_hyperstack.tif        all preview slices in one ImageJ hyperstack (axes TZCYX), for Fiji:
+                                T = input, then each checkpoint (label); Z = preview slice;
+                                C = prediction (the input itself for T = input), residual (zero for
+                                the input). Grayscale mode, display ranges preset: prediction = input
+                                FOV mean +- 3 std, residual = +- 3 x the input's neighbour-difference
+                                noise estimate (the training prediction images' rule), over the
+                                preview slices
 Prints per checkpoint: output / residual statistics inside the FOV (central slices).
 
 --half_res {binned, subsample, both}: instead of the full-res volume, denoise reconstructions at the
@@ -214,6 +221,48 @@ def main():
         tifffile.imwrite(path, np.stack([f for f, _, _ in ordered]).astype(np.float32),
                          imagej=True, metadata={"Labels": [l for _, l, _ in ordered]})
         print(f"saved {path}")
+
+    write_hyperstack(previews, args.slices, out_dir)
+
+
+def write_hyperstack(previews, slices, out_dir):
+    """All preview slices in one TZCYX hyperstack (see the module docstring)."""
+    def entries(items):
+        # items are in append order: the input(s) first, then (output, residual) pairs per checkpoint
+        out, i = [], 0
+        while i < len(items):
+            frame, label, role = items[i]
+            if role == "input":
+                out.append((label.rsplit(" z", 1)[0], frame, np.zeros_like(frame)))
+                i += 1
+            else:
+                out.append((label.rsplit(" z", 1)[0], frame, items[i + 1][0]))
+                i += 2
+        return out
+
+    per_z = [entries(previews[z]) for z in slices]
+    names = [name for name, _, _ in per_z[0]]
+    shape = per_z[0][0][1].shape
+    stack = np.zeros((len(names), len(slices), 2) + shape, dtype=np.float32)
+    labels = []
+    for t, name in enumerate(names):
+        for zi, z in enumerate(slices):
+            _, pred, res = per_z[zi][t]
+            stack[t, zi, 0], stack[t, zi, 1] = pred, res
+            labels += [f"{name} | z{z} | prediction", f"{name} | z{z} | residual"]
+
+    inp = stack[0, :, 0]
+    fov = inp != 0
+    vals = inp[fov]
+    p_lo, p_hi = float(vals.mean() - 3 * vals.std()), float(vals.mean() + 3 * vals.std())
+    both = fov[:, :, 1:] & fov[:, :, :-1]
+    r = float(3 * (inp[:, :, 1:] - inp[:, :, :-1])[both].std() / np.sqrt(2))
+
+    path = os.path.join(out_dir, "compare_hyperstack.tif")
+    tifffile.imwrite(path, stack, imagej=True,
+                     metadata={"axes": "TZCYX", "Labels": labels, "mode": "grayscale", "Ranges": (p_lo, p_hi, -r, r)})
+    print(f"saved {path}: T = {names}; Z = slices {list(slices)}; C = prediction, residual; "
+          f"display prediction {p_lo:.4g}..{p_hi:.4g}, residual +-{r:.4g}")
 
 
 if __name__ == "__main__":

@@ -323,6 +323,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 cone_slices_per_realization = "split",
                 cone_mix_realizations = False,
                 cone_n_projections = None,
+                reg_weight_max = None,
 
                 ):
         
@@ -354,6 +355,8 @@ class Neighbor2InverseSlice(pl.LightningModule):
         self.Lambda1 = Lambda1
         self.Lambda2 = Lambda2
         self.increase_ratio = increase_ratio
+        # Optional cap on the cone L_reg weight (cone_reg_weight): None -> upstream's uncapped ramp.
+        self.reg_weight_max = None if reg_weight_max is None else float(reg_weight_max)
         self.n_epoch = n_epoch
         self.lr = lr
         self.loss_type = loss_type
@@ -692,8 +695,15 @@ class Neighbor2InverseSlice(pl.LightningModule):
     # ------------------------------------------------------------------
 
     def cone_reg_weight(self):
-        """Upstream's L_reg weight schedule: 0 at epoch 0, increase_ratio * (n_epoch - 1) / n_epoch at the end."""
-        return self.current_epoch / self.n_epoch * self.increase_ratio
+        """
+        Upstream's L_reg weight schedule: 0 at epoch 0, increase_ratio * (n_epoch - 1) / n_epoch at the end.
+        With reg_weight_max set, the ramp is held at that value once it gets there
+        (e.g. increase_ratio 2, reg_weight_max 1, n_epoch 50: weight 1 from epoch 25 on).
+        """
+        w = self.current_epoch / self.n_epoch * self.increase_ratio
+        if self.reg_weight_max is not None:
+            w = min(w, self.reg_weight_max)
+        return w
 
     def load_fullres_cone(self, path_reco_fullres):
         """Full-res reconstruction R[T p] (input of f(y)), from 0_calculateStatsCone.py --save_dir."""
@@ -926,26 +936,27 @@ class Neighbor2InverseSlice(pl.LightningModule):
                            scan_id, realization_idx, batch_number, slice_indices,
                            losses, losses_nei, losses_reg):
         """
+        This function defines one complete learning step
         One cone optimizer update on normalised [B, 1, H, W] batches (batch_exp: L_reg correction or
         None), with the per-update diagnostics. realization_idx 0 = mixed batch (several masks).
         """
-        noisy_inpt, pad = pad_to_divisible(batch_sub1, 32)
+        noisy_inpt, pad = pad_to_divisible(batch_sub1, 32) # pad the input to make sure images line up after subsampling and upscaling steps
 
-        optimizer.zero_grad()
+        optimizer.zero_grad() # remove gradients from previous update 
 
         # Fresh autocast context per update, so the forward uses the current weights.
-        with self._step_autocast():
-            noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
+        with self._step_autocast(): # update chached weights at the beginning of every forward pass
+            noisy_output = unpad_from_divisible(self(noisy_inpt), pad) # self(noisy_inpt) runs the input through the network: f(g1(y))
             if self.regularizer:
                 # Upstream: loss = Lambda1*L_Nei + Lambda2*w*L_reg; exp_diff carries no gradient.
-                diff = noisy_output.float() - batch_sub2.float()
-                loss_nei = torch.mean(diff ** 2)
-                loss_reg = torch.mean((diff - batch_exp) ** 2)
+                diff = noisy_output.float() - batch_sub2.float() # f(g1(y)) - g2(y)
+                loss_nei = torch.mean(diff ** 2)                 # L_Nei
+                loss_reg = torch.mean((diff - batch_exp) ** 2)   # L_reg
                 loss = self.Lambda1 * loss_nei + self.Lambda2 * reg_weight * loss_reg
                 del diff
             else:
-                loss = self.loss(noisy_output, batch_sub2)
-            self.manual_backward(loss)
+                loss = self.loss(noisy_output, batch_sub2)       # MSE (same as loss_nei above)
+            self.manual_backward(loss)                           # backpropagation
         grad_norm = self._grad_norm()  # before the step, i.e. the gradient this update uses
 
         # Output decomposition for this batch (same output the loss used):
@@ -977,12 +988,12 @@ class Neighbor2InverseSlice(pl.LightningModule):
             )
 
         params_before = self._flat_params()
-        optimizer.step()
+        optimizer.step()                        # update the weights based on gradients from backprop
         with torch.no_grad():
             dtheta = float(torch.linalg.vector_norm(self._flat_params() - params_before))
         del params_before
 
-        losses.append(loss.detach())
+        losses.append(loss.detach())    # record the loss for that step (these are averaged over 24 steps)
         reg_msg = ""
         if self.regularizer:
             losses_nei.append(loss_nei.detach())

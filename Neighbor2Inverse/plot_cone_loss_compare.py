@@ -27,10 +27,9 @@ import matplotlib.pyplot as plt
 #     "Lnei + Lreg": Path("slurm/logs/n2i_cone_lreg_60981430.out"),
 # }
 runs = {
-    "Lnei": Path("slurm/logs/n2i_cone_baseline_61034810.out"),
-    "Lnei + Lreg": Path("slurm/logs/n2i_cone_lreg_60999940.out"),
-    "Lnei + Lreg_r4_50 epoch": Path("slurm/logs/n2i_cone_lreg_61062788.out"),
-    "Lnei + Lreg_r4_100 epoch": Path("slurm/logs/n2i_cone_lreg_r4_e100_61088056.out"),
+    "L_Nei + Lreg (s42) r1 capped":                  Path("slurm/n2i_cone_noisy_Lreg_upst_r1_s42_61745215.out"),
+    "L_Nei + Lreg (s43) r1 capped":                  Path("slurm/n2i_cone_noisy_Lreg_upst_r1_s43_61745216.out"),
+    "L_Nei + Lreg (s44) r1 capped":                  Path("slurm/n2i_cone_noisy_Lreg_upst_r1_s44_61745217.out"),
 }
 
 RE_VAL = re.compile(r"Cone validation loss for \S+: ([0-9.eE+-]+)(?: \(L_Nei=([0-9.eE+-]+), L_reg=([0-9.eE+-]+)\))?")
@@ -98,7 +97,7 @@ for name, path in runs.items():
         f"final {p['val_nei'][-1]:.6f}"
         + (f"; final val L_reg {p['val_reg'][-1]:.6f}" if has_reg else "")
         + f"; learning rate changes after epochs "
-        + (", ".join(str(e) for e, a, b in zip(p["val_epochs"][:-1], p["lr"][:-1], p["lr"][1:]) if b != a) or "none")
+        + (", ".join(str(e) for e, a, b in zip(p["val_epochs"][1:], p["lr"][:-1], p["lr"][1:]) if b != a) or "none")
     )
 
 colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -111,8 +110,8 @@ for k, (name, p) in enumerate(parsed.items()):
     if np.isfinite(p["val_reg"]).any():
         ax.plot(p["val_epochs"], p["val_reg"], color=c, ls="--", label=f"{name}: L_reg (weight 1)")
 ax.set_xlabel("Epoch")
-ax.set_ylabel("Validation loss (Mouse_10)")
-ax.set_title("Cone N2I validation: L_Nei comparable across runs")
+ax.set_ylabel("Validation loss")
+ax.set_title("Validation loss")
 ax.legend()
 ax.grid(alpha=0.25)
 fig.tight_layout()
@@ -134,7 +133,7 @@ for k, (name, p) in enumerate(parsed.items()):
         ax2.plot(p["train_epochs"], p["weight"], color=c, ls=":", alpha=0.7, label=f"{name}: weight w")
 ax.set_xlabel("Epoch")
 ax.set_ylabel("Training loss (mean over updates)")
-ax.set_title("Cone N2I training: L_Nei comparable across runs")
+ax.set_title("Training loss")
 handles, labels = ax.get_legend_handles_labels()
 if ax2 is not None:
     h2, l2 = ax2.get_legend_handles_labels()
