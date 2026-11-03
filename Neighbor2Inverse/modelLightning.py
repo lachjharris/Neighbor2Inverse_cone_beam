@@ -324,6 +324,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 cone_mix_realizations = False,
                 cone_n_projections = None,
                 reg_weight_max = None,
+                ema_decays = None,
 
                 ):
         
@@ -403,6 +404,21 @@ class Neighbor2InverseSlice(pl.LightningModule):
                 raise ValueError(
                     "coneBeam=True requires df_stats_path (per-scan stats from 0_calculateStatsCone.py)"
                 )
+
+        # Optional exponential moving averages (EMA) of the weights, one per decay, e.g. [0.99, 0.996].
+        # None or [] -> off (training and outputs unchanged). Training always uses the raw weights;
+        # the EMA copies are only evaluated: validation L_Nei, prediction images, and stored in every
+        # checkpoint under "ema" (the checkpoint's state_dict stays the raw weights). See _ema_update.
+        self.ema_decays = [float(b) for b in (ema_decays or [])]
+        for b in self.ema_decays:
+            if not 0.0 < b < 1.0:
+                raise ValueError(f"ema_decays must lie in (0, 1), got {b!r}")
+        if len(set(self.ema_decays)) != len(self.ema_decays):
+            raise ValueError(f"ema_decays must be distinct, got {self.ema_decays!r}")
+        if self.ema_decays and not self.coneBeam:
+            raise NotImplementedError("ema_decays is only implemented for the cone path (coneBeam: True)")
+        self._ema = {}         # decay -> {parameter name: float32 tensor}, bias-corrected EMA
+        self._ema_steps = 0    # optimizer updates averaged so far (the same for every decay)
 
     def forward(self, x):
         return self.network(x)
@@ -932,6 +948,93 @@ class Neighbor2InverseSlice(pl.LightningModule):
             return torch.autocast("cpu", dtype=torch.get_autocast_cpu_dtype(), cache_enabled=False)
         return contextlib.nullcontext()
 
+    # ------------------------------------------------------------------
+    # EMA of the weights (ema_decays)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def ema_tag(decay):
+        """Name used for one EMA in logs, metric keys and folders: 0.996 -> 'ema0p996'."""
+        return "ema" + f"{decay:g}".replace(".", "p")
+
+    def ema_ready(self):
+        """Decays whose EMA exists, i.e. at least one update has been averaged (not before training)."""
+        return [b for b in self.ema_decays if b in self._ema]
+
+    def _ema_update(self):
+        """
+        After every optimizer step: e_t = e_(t-1) + w_t (theta_t - e_(t-1)), w_t = (1 - b) / (1 - b^t).
+        This is the bias-corrected EMA (as in Adam), so e_1 = theta_1 and the early average is not
+        pulled towards the initial weights; w_t falls to 1 - b after a few time constants (1 / (1 - b)
+        updates). float32, no gradients; does not touch the raw weights or any random state.
+        """
+        if not self.ema_decays:
+            return
+        self._ema_steps += 1
+        t = self._ema_steps
+        with torch.no_grad():
+            params = list(self.named_parameters())
+            for b in self.ema_decays:
+                ema = self._ema.get(b)
+                if ema is None:
+                    if t != 1:
+                        raise RuntimeError(f"EMA {b} missing at update {t} (checkpoint without it?)")
+                    self._ema[b] = {n: p.detach().float().clone() for n, p in params}
+                    continue
+                w = (1.0 - b) / (1.0 - b ** t)
+                for n, p in params:
+                    if ema[n].device != p.device:  # restored from a checkpoint on the CPU
+                        ema[n] = ema[n].to(p.device)
+                    ema[n].lerp_(p.detach().float(), w)
+
+    @contextlib.contextmanager
+    def ema_weights(self, decay):
+        """
+        Temporarily load the EMA weights for `decay` into the network; the raw weights are restored
+        bit-exactly on exit (also after an error). The optimizer state is untouched.
+        Inside an autocast context with the weight cache on (e.g. Lightning's validation_step), wrap
+        the forward in self._step_autocast(): a cached low-precision copy would otherwise keep using
+        the raw weights.
+        """
+        ema = self._ema[decay]
+        params = list(self.named_parameters())
+        with torch.no_grad():
+            backup = [p.detach().clone() for _, p in params]
+            for n, p in params:
+                p.copy_(ema[n])
+        try:
+            yield
+        finally:
+            with torch.no_grad():
+                for (_, p), saved in zip(params, backup):
+                    p.copy_(saved)
+            del backup
+
+    def on_save_checkpoint(self, checkpoint):
+        """Store the EMA weights next to the raw state_dict (same parameter names, so either loads)."""
+        if self._ema:
+            checkpoint["ema"] = {
+                "steps": self._ema_steps,
+                "weights": {
+                    self.ema_tag(b): {"decay": b,
+                                      "state_dict": {n: t.detach().cpu().clone() for n, t in e.items()}}
+                    for b, e in self._ema.items()
+                },
+            }
+
+    def on_load_checkpoint(self, checkpoint):
+        """Resume the EMAs from a checkpoint (Lightning resume). The configured decays must match."""
+        saved = checkpoint.get("ema")
+        if not self.ema_decays:
+            return
+        if saved is None:
+            raise ValueError("ema_decays is set but the checkpoint has no EMA weights")
+        decays = sorted(v["decay"] for v in saved["weights"].values())
+        if decays != sorted(self.ema_decays):
+            raise ValueError(f"checkpoint EMA decays {decays} != configured {sorted(self.ema_decays)}")
+        self._ema = {v["decay"]: dict(v["state_dict"]) for v in saved["weights"].values()}
+        self._ema_steps = int(saved["steps"])
+
     def _cone_train_update(self, optimizer, batch_sub1, batch_sub2, batch_exp, reg_weight,
                            scan_id, realization_idx, batch_number, slice_indices,
                            losses, losses_nei, losses_reg):
@@ -992,6 +1095,7 @@ class Neighbor2InverseSlice(pl.LightningModule):
         with torch.no_grad():
             dtheta = float(torch.linalg.vector_norm(self._flat_params() - params_before))
         del params_before
+        self._ema_update()                      # EMA of the weights (no-op unless ema_decays is set)
 
         losses.append(loss.detach())    # record the loss for that step (these are averaged over 24 steps)
         reg_msg = ""
@@ -1287,6 +1391,24 @@ class Neighbor2InverseSlice(pl.LightningModule):
             prog_bar=True,
             batch_size=1,
         )
+
+        # EMA weights: L_Nei on the same validation pair (no L_reg: its correction would need a
+        # full-res denoise, forward projection and FDK per EMA). Not used for the LR scheduler or
+        # checkpoint selection, which stay on the raw val_loss above.
+        for decay in self.ema_ready():
+            sq_err_ema = 0.0
+            with self.ema_weights(decay):
+                for start in range(0, reco_sub1.shape[0], self.val_batch_size):
+                    batch_sub1 = reco_sub1[start:start + self.val_batch_size].unsqueeze(1)
+                    batch_sub2 = reco_sub2[start:start + self.val_batch_size].unsqueeze(1)
+                    noisy_inpt, pad = pad_to_divisible(batch_sub1, 32)
+                    with self._step_autocast():  # no weight cache, so the swapped-in EMA weights are used
+                        noisy_output = unpad_from_divisible(self(noisy_inpt), pad)
+                    sq_err_ema += float(((noisy_output.float() - batch_sub2.float()) ** 2).sum())
+            loss_ema = sq_err_ema / n_elements
+            print(f"Cone EMA validation for {scan_id} (decay {decay:g}, {self._ema_steps} updates): "
+                  f"L_Nei={loss_ema:.6f}")
+            self.log(f"val_loss1_{self.ema_tag(decay)}", loss_ema, on_epoch=True, sync_dist=True, batch_size=1)
 
         return loss
 

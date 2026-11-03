@@ -258,6 +258,11 @@ class SavePredictionCallbackCone(Callback):
     noise estimate of the input slice (horizontal neighbour differences in the FOV), fixed on the
     first call. It depends only on the input slice, so runs on the same slice get the same window.
     The residual numbers are also printed to the .out ("prediction callback ...").
+    With ema_decays set on the model, the same images are also saved for every EMA of the weights,
+    in the same folder with the EMA tag before "_progress" (e.g.
+    epoch_12_noisy_M3_slice340_ema0p996_progress.tif), printed as "prediction callback [ema0p996] ...".
+    At train start no update has been averaged yet, so the EMA "start" images use the initial weights
+    (identical to the raw start image); this gives every EMA the same time points as the raw images.
     """
     def __init__(self, output_dir, volume_path, scan_id, slice_idx=None, show_residual=True,
                  residual_range=None, save_tiff=True):
@@ -303,12 +308,22 @@ class SavePredictionCallbackCone(Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.is_global_zero:
             self.save_current_progress(trainer, pl_module, "epoch")
+            # EMA weights (if any). Epoch-end hooks run outside autocast, so swapping them in is enough.
+            ema_ready = getattr(pl_module, "ema_ready", None)
+            for decay in (ema_ready() if ema_ready is not None else []):
+                tag = pl_module.ema_tag(decay)
+                with pl_module.ema_weights(decay):
+                    self.save_current_progress(trainer, pl_module, "epoch", suffix=f"_{tag}", label=f" [{tag}]")
 
     def on_train_start(self, trainer, pl_module):
         if trainer.is_global_zero:
             self.save_current_progress(trainer, pl_module, "start")
+            # EMA start images = initial weights (no update averaged yet), so all groups share time points.
+            for decay in getattr(pl_module, "ema_decays", []):
+                tag = pl_module.ema_tag(decay)
+                self.save_current_progress(trainer, pl_module, "start", suffix=f"_{tag}", label=f" [{tag}]")
 
-    def save_current_progress(self, trainer, pl_module, name):
+    def save_current_progress(self, trainer, pl_module, name, suffix="", label=""):
         from modelLightning import pad_to_divisible, unpad_from_divisible
 
         was_training = pl_module.training
@@ -327,14 +342,14 @@ class SavePredictionCallbackCone(Callback):
         del input_image, inpt_pad, predicted_image
 
         stem = os.path.join(self.output_dir,
-                            f"{name}_{trainer.current_epoch}_{self.scan_id}_slice{self.slice_idx}_progress")
+                            f"{name}_{trainer.current_epoch}_{self.scan_id}_slice{self.slice_idx}{suffix}_progress")
         stats = save_cone_progress_panels(
             stem + ".png", stem + ".tif", self.slice, pred, self.fov, self.residual_range,
-            title=f"{name} {trainer.current_epoch}: {self.scan_id} slice {self.slice_idx}",
+            title=f"{name}{label} {trainer.current_epoch}: {self.scan_id} slice {self.slice_idx}",
             scan_mean=mean, scan_std=std, show_residual=self.show_residual, save_tiff=self.save_tiff,
         )
         if stats is not None:
-            print(f"prediction callback {name} {trainer.current_epoch}: residual std {stats['std']:.5g} "
+            print(f"prediction callback{label} {name} {trainer.current_epoch}: residual std {stats['std']:.5g} "
                   f"({stats['std_over_scan_std']:.4f} scan std), mean {stats['mean']:.4g}, "
                   f"clipped {100 * stats['clipped_fraction']:.2f}% of FOV")
 

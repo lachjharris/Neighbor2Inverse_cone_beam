@@ -19,6 +19,12 @@ Every run must have the same input slice and the same epochs. --crop y0 y1 x0 x1
 pixel region (rows y0..y1-1, cols x0..x1-1) to keep the file small; the display ranges are computed
 from the cropped input.
 
+EMA images (runs with ema_decays) are named ..._slice<k>_<tag>_progress.tif (tag e.g. ema0p996). The
+per-run mode writes one stack per group (raw and each EMA). In --combine mode, --groups picks the group
+per run: raw (default for every run) or an EMA tag; the same run may be given twice, e.g. raw vs EMA:
+    python make_epoch_stacks.py --combine --runs <run> <run> --groups raw ema0p996 --names r1 r1_ema \
+        --out_name s43_r1_raw_vs_ema
+
 Usage (from PBPC_data/):
     python make_epoch_stacks.py --runs model_weights/Cone/<run1> model_weights/Cone/<run2> ...
     python make_epoch_stacks.py --combine --runs <run1> <run2> --names LNei r1 --out_name s43_LNei_vs_r1 \
@@ -33,6 +39,22 @@ import numpy as np
 import tifffile
 
 PATTERN = re.compile(r"^(start|epoch)_(\d+)_(.+)_progress\.tif$")
+EMA_GROUP = re.compile(r"^(.+)_(ema[0-9p]+)$")  # <scan>_slice<k>_ema0p996 -> (<scan>_slice<k>, ema0p996)
+
+
+def split_group(scan_slice):
+    """<scan>_slice<k>[_<ema tag>] -> (<scan>_slice<k>, 'raw' or the EMA tag)."""
+    m = EMA_GROUP.match(scan_slice)
+    return (m.group(1), m.group(2)) if m else (scan_slice, "raw")
+
+
+def select_group(pred_dir, groups, group):
+    """The one scan/slice of a run in the requested group ('raw' or an EMA tag)."""
+    found = {split_group(k)[0]: v for k, v in groups.items() if split_group(k)[1] == group}
+    if len(found) != 1:
+        raise ValueError(f"{pred_dir}: expected one scan/slice in group '{group}', found {sorted(found)} "
+                         f"(all groups: {sorted(groups)})")
+    return next(iter(found.items()))
 
 
 def noise_estimate(img, fov):
@@ -94,16 +116,17 @@ def build(run_dir, out_dir):
         print(f"    wrote {out}  shape {stack.shape}; display prediction {p_lo:.4g}..{p_hi:.4g}, residual +-{r:.4g}")
 
 
-def build_combined(run_dirs, names, out_dir, out_name, crop=None):
+def build_combined(run_dirs, names, out_dir, out_name, crop=None, group_names=None):
     """One TZCYX hyperstack: T = epoch, Z = run, C = prediction / residual (see the module docstring)."""
     if len(names) != len(run_dirs):
         raise ValueError("--names needs one name per run")
+    group_names = group_names or ["raw"] * len(run_dirs)
+    if len(group_names) != len(run_dirs):
+        raise ValueError("--groups needs one entry per run (raw or an EMA tag such as ema0p996)")
     per_run = []
-    for run_dir in run_dirs:
+    for run_dir, group in zip(run_dirs, group_names):
         pred_dir, groups = collect(run_dir)
-        if len(groups) != 1:
-            raise ValueError(f"{pred_dir}: expected one scan/slice, found {sorted(groups)}")
-        (scan_slice, items), = groups.items()
+        scan_slice, items = select_group(pred_dir, groups, group)
         per_run.append((pred_dir, scan_slice, items))
     scan_slice = per_run[0][1]
     times = [label for _, label, _ in per_run[0][2]]
@@ -152,12 +175,16 @@ def main():
     p.add_argument("--out_name", help="--combine: output file name prefix")
     p.add_argument("--crop", nargs=4, type=int, metavar=("Y0", "Y1", "X0", "X1"),
                    help="--combine: keep rows Y0..Y1-1 and cols X0..X1-1")
+    p.add_argument("--groups", nargs="+",
+                   help="--combine: per run, raw (default) or an EMA tag such as ema0p996")
     args = p.parse_args()
     if args.combine:
         if not args.names or not args.out_name:
             p.error("--combine needs --names and --out_name")
-        build_combined(args.runs, args.names, args.out_dir, args.out_name, args.crop)
+        build_combined(args.runs, args.names, args.out_dir, args.out_name, args.crop, args.groups)
     else:
+        if args.groups:
+            p.error("--groups is for --combine (the per-run mode writes every group)")
         for run_dir in args.runs:
             build(run_dir, args.out_dir)
 
